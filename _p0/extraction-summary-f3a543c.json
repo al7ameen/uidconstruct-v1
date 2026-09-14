@@ -1,0 +1,164 @@
+{
+  "_note": "SANITIZED SUMMARY of a single live extraction, retained as P0 research evidence. The raw API response was deliberately NOT committed to this public repository because it embedded verbatim third-party page copy. Only factual, non-copyrightable data is kept: measured values, counts, and technical identifiers. No third-party marketing prose is reproduced here.",
+  "source": {
+    "url": "https://claude.com/?v=f3a543c",
+    "domain": "claude.com",
+    "pageFetchedLive": true,
+    "codeSnapshot": "f3a543c",
+    "tool": "POST /api/deconstruct (snapshot f3a543c)"
+  },
+  "extractionMetadata": {
+    "httpStatus": 200,
+    "cached": false,
+    "truncated": false,
+    "timings": {
+      "fetchMs": 334,
+      "aiMs": 30570,
+      "totalMs": 31600,
+      "outputChars": 5409
+    },
+    "rawResponseBytes": 29946,
+    "sanitizedOn": "2026-09-14"
+  },
+  "pageStructure": {
+    "sections": 3,
+    "cards": 5,
+    "links": 231,
+    "buttons": 24,
+    "forms": 1,
+    "lists": 39,
+    "videos": 1,
+    "headings": {
+      "total": 19,
+      "h1": 1,
+      "h2": 12,
+      "h3": 6
+    },
+    "navigationLabels": 20,
+    "ctaButtons": 16,
+    "bodyParagraphs": 7,
+    "listItems": 23,
+    "footerLinkGroups": 10,
+    "formFields": 1,
+    "defaultTheme": "light",
+    "darkMode": "prefers-color-scheme"
+  },
+  "designObservations": {
+    "tokenSet": {
+      "total": 44,
+      "color": 20,
+      "geometry": 16,
+      "type": 8
+    },
+    "neutralPaletteRamp": [
+      "#fff",
+      "#faf9f5",
+      "#f5f4ed",
+      "#f0eee6",
+      "#e8e6dc",
+      "#dedcd1",
+      "#d1cfc5",
+      "#c2c0b6",
+      "#b0aea5",
+      "#9c9a92",
+      "#87867f",
+      "#73726c",
+      "#5e5d59",
+      "#4d4c48",
+      "#3d3d3a",
+      "#30302e",
+      "#262624",
+      "#1f1e1d",
+      "#1a1918",
+      "#141413"
+    ],
+    "geometryValues": [
+      ".5px",
+      "1px",
+      "1.5px",
+      "2px",
+      "16px",
+      "24px",
+      "32px",
+      "48px",
+      "2px",
+      "4px",
+      "6px",
+      "8px",
+      "clamp(20px,19.143px + .268vw,23px)",
+      "17px",
+      "15px",
+      "12px"
+    ],
+    "fontFamiliesInExtraction": "3 vendor-derived families (sans / serif / monospace), each with a synthetic fallback alias",
+    "breakpointCount": 12,
+    "breakpoints": [
+      "834px",
+      "1200px",
+      "833px",
+      "991px",
+      "1000px",
+      "566px",
+      "1199px",
+      "600px",
+      "900px",
+      "768px",
+      "1780px",
+      "767px"
+    ],
+    "fontSourceCount": 6
+  },
+  "technicalObservations": {
+    "componentRules": 15,
+    "componentSelectorsAreCssModuleScoped": true,
+    "motionDeclarations": 17,
+    "motionPatterns": [
+      "clip-path inset reveal",
+      "translateY rise/fade",
+      "opacity pulse",
+      "rotate"
+    ],
+    "reducedMotionHandled": true,
+    "assetReferencesInRawResponse": 2,
+    "legacySignalArraysEmpty": [
+      "fonts",
+      "fontSizes",
+      "colors",
+      "layoutPatterns",
+      "componentPatterns",
+      "responsiveBreakpoints"
+    ]
+  },
+  "identityLeakage": {
+    "_why": "Measured on the raw response; this is the primary P0 finding driving lib/identity.js.",
+    "brandMentionsInPageOutline": 44,
+    "vendorMentionsInPageOutline": 6,
+    "brandMentionsInPrompt": 45,
+    "vendorMentionsInPrompt": 7,
+    "brandDerivedFontFamilyNames": 3,
+    "selectorsWithModuleHashes": "13 of 15",
+    "cdnAssetHosts": 1
+  },
+  "excludedFromThisRepo": {
+    "verbatimPageText": {
+      "field": "signals.pageOutline",
+      "chars": 4691,
+      "reason": "verbatim third-party page prose (title, headings, nav labels, body copy, list items, footer groups)"
+    },
+    "verbatimCopyBlock": {
+      "field": "prompt section 13",
+      "chars": 4829,
+      "reason": "verbatim third-party marketing copy"
+    },
+    "modelNarrative": {
+      "field": "prompt sections 1-8",
+      "chars": -5001,
+      "reason": "contained quoted third-party taglines and headings"
+    },
+    "verbatimVerbatimBlocks": {
+      "field": "prompt sections 10-15",
+      "chars": -10001,
+      "reason": "wholesale verbatim CSS-in-JS rule text and site copy"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.DS_Store
+*.log
+dist/
+build/
+
+# Raw extraction artifacts can embed verbatim third-party page content
+# (site copy, headings, nav labels) plus internal prompt scaffolding.
+# NEVER commit these. Commit sanitized summaries instead:
+#   _p0/extraction-summary-*.json
+_p0/extraction-blob-*.json
+_p0/*-blob-*.json
+_p0/raw-*.json
+extraction-blob-*.json

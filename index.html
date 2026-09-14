@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>uidconstruct — Turn URLs into buildable specs</title>
+    <meta name="description" content="Paste a URL, get the design spec behind it. Real colors, type, spacing and layout from the live page, as a prompt for v0, Cursor, Bolt, Lovable." />
+
+    <!-- Social preview -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="uidconstruct" />
+    <meta property="og:title" content="uidconstruct — any website, turned into a build prompt" />
+    <meta property="og:description" content="Paste a URL, get the design spec behind it. Real colors, type, spacing and layout from the live page, as a prompt for v0, Cursor, Bolt, Lovable." />
+    <meta property="og:url" content="https://uidconstruct.vercel.app/" />
+    <meta property="og:image" content="https://uidconstruct.vercel.app/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="uidconstruct — any website, turned into a build prompt" />
+    <meta name="twitter:description" content="Paste a URL, get the design spec behind it. Real colors, type, spacing and layout from the live page, as a prompt for v0, Cursor, Bolt, Lovable." />
+    <meta name="author" content="al7ameen" />
+
+    <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebApplication","name":"uidconstruct","url":"https://uidconstruct.vercel.app/","applicationCategory":"DeveloperApplication","operatingSystem":"Web","description":"Paste a URL, get the design spec behind it. Real colors, type, spacing and layout from the live page, as a prompt for v0, Cursor, Bolt, Lovable.","creator":{"@type":"Person","name":"al7ameen","url":"https://github.com/al7ameen","sameAs":["https://github.com/al7ameen","https://www.instagram.com/al7.ameen"]},"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}</script>
+
+
+    <!-- Theme must be resolved before first paint. The hardcoded
+         data-theme="light" on the root element is what a dark-mode user
+         flashes past while app.js (loaded at end of body) runs setTheme().
+         Inline + tiny, so it executes during head parsing. -->
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('uid-theme');
+                if (t !== 'dark' && t !== 'light') {
+                    t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                }
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (_) { /* private mode / blocked storage -> keep light */ }
+
+            // Entrance animations are a first-impression nicety. Replaying
+            // them on every refresh is what looked like a "skeleton": the
+            // hero sat at opacity:0 for ~570ms while the navbar, background
+            // and footer were already painted. A reload is not a first
+            // impression, so skip it. Runs here, before first paint, so
+            // there is no flash-then-hide.
+            try {
+                var nav = performance.getEntriesByType('navigation')[0];
+                var type = nav ? nav.type : (performance.navigation && performance.navigation.type);
+                if (type === 'reload' || type === 1 || type === 'back_forward' || type === 2) {
+                    document.documentElement.setAttribute('data-anim', 'off');
+                }
+            } catch (_) { /* no Navigation Timing -> keep the animation */ }
+        })();
+    </script>
+
+    <!-- Fonts -->
+    <link rel="preload" href="/fonts/dm-sans-latin-var.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/instrument-serif-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="/fonts.css" />
+
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e63b2e'/%3E%3Ctext x='16' y='22' font-family='Georgia,serif' font-size='17' fill='white' text-anchor='middle'%3Eu%3C/text%3E%3C/svg%3E" />
+
+    <!-- Stylesheet -->
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+    <!-- Skip to content for accessibility -->
+    <a href="#main" class="skip-link">Skip to content</a>
+
+    <!-- NAVIGATION -->
+    <header class="navbar" id="navbar" role="banner">
+        <div class="container">
+            <a href="#" class="logo" aria-label="uidconstruct home">uid<span>construct</span></a>
+
+            <button class="nav-mobile-toggle" id="navToggle" aria-label="Toggle navigation menu" aria-expanded="false">
+                <span aria-hidden="true">☰</span>
+            </button>
+
+            <nav class="nav-links" id="navLinks" role="navigation" aria-label="Main navigation">
+                <a href="#steps">How it works</a>
+                <a href="#pricing">Pricing</a>
+                <a href="https://github.com/al7ameen/uidconstruct" target="_blank" rel="noopener noreferrer">GitHub</a>
+                <button class="theme-toggle-btn" id="themeToggle" aria-label="Toggle theme">
+                    <span id="themeIcon" aria-hidden="true"></span>
+                    <span id="themeLabel">Dark</span>
+                </button>
+            </nav>
+        </div>
+    </header>
+
+    <!-- MAIN CONTENT -->
+    <main id="main">
+
+        <!-- HERO -->
+        <section class="hero" aria-labelledby="hero-headline">
+            <div class="container">
+                <div class="hero-content">
+                    <div class="hero-badge fade-in">
+                        <span class="badge-dot"></span>
+                        UIDCONSTRUCT · FREE BETA
+                    </div>
+
+                    <h1 class="fade-in fade-in-d1" id="hero-headline">
+                        Any website,<br />
+                        <span class="highlight">turned into a build prompt.</span>
+                    </h1>
+
+                    <p class="subhead fade-in fade-in-d2">
+                        Paste a URL. Get the design spec behind it — real colors, type
+                        scale, spacing and layout, read from the live page — as a prompt
+                        you can drop straight into v0, Cursor, Bolt or Lovable.
+                    </p>
+
+                    <!-- INPUT AREA -->
+                    <div class="input-area fade-in fade-in-d3">
+                        <div class="input-row">
+                            <label for="urlInput" class="sr-only">Website URL to analyze</label>
+                            <input
+                                type="url"
+                                id="urlInput"
+                                placeholder="https://linear.app"
+                                value="https://linear.app"
+                                aria-describedby="url-error"
+                                autocomplete="url"
+                                spellcheck="false"
+                            />
+                            <button class="btn-primary" id="deconstructBtn">
+                                <span id="btnText">Generate prompt</span>
+                                <span id="btnSpinner" class="spinner" style="display:none;" aria-hidden="true"></span>
+                            </button>
+                        </div>
+                        <div id="url-error" class="error-message" role="alert" aria-live="assertive"></div>
+
+                        <!-- Email capture: only useful list we can build pre-launch -->
+                        <div class="waitlist" id="waitlist">
+                            <span class="wl-prompt" id="wlPrompt">Get notified when Pro launches — no spam, one email.</span>
+                            <form class="wl-form" id="wlForm" novalidate>
+                                <label for="wlEmail" class="sr-only">Email address</label>
+                                <input type="email" id="wlEmail" placeholder="you@company.com" autocomplete="email" />
+                                <button type="submit" class="btn-secondary" id="wlBtn">Notify me</button>
+                            </form>
+                        </div>
+
+                        <!-- BYOK: removes our cost + our rate limit -->
+                        <button type="button" class="byok-toggle" id="byokToggle" aria-expanded="false" aria-controls="byokPanel">
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+                            Hit the limit? Use your own AI key
+                        </button>
+
+                        <div class="byok-panel" id="byokPanel" hidden>
+                            <div class="byok-grid">
+                                <div class="byok-field">
+                                    <label for="byokProvider">Provider</label>
+                                    <select id="byokProvider">
+                                        <option value="openai">OpenAI</option>
+                                        <option value="anthropic">Anthropic</option>
+                                        <option value="custom">Custom URL</option>
+                                    </select>
+                                </div>
+                                <div class="byok-field">
+                                    <label for="byokModel">Model (required)</label>
+                                    <input type="text" id="byokModel" placeholder="gpt-4o-mini" autocomplete="off" spellcheck="false" />
+                                </div>
+                                <p class="byok-hint" id="byokCustomHint" hidden>
+                                    Any OpenAI-compatible endpoint: OpenRouter, Groq, Together, DeepSeek, Azure, or a local gateway.
+                                    Paste the base URL (e.g. <code>https://openrouter.ai/api/v1</code>) — we append the rest.
+                                    Model IDs with a slash like <code>meta-llama/llama-3.3-70b-instruct</code> work.
+                                    HTTPS only, and we never follow redirects from it, so your key can't be forwarded to another host.
+                                </p>
+                                <div class="byok-field byok-field-wide" id="byokBaseUrlField" hidden>
+                                    <label for="byokBaseUrl">API base URL</label>
+                                    <input type="url" id="byokBaseUrl" placeholder="https://openrouter.ai/api/v1" autocomplete="off" spellcheck="false" inputmode="url" />
+                                </div>
+                                <div class="byok-field byok-field-wide">
+                                    <label for="byokKey">API key</label>
+                                    <input type="password" id="byokKey" placeholder="sk-..." autocomplete="off" spellcheck="false" />
+                                </div>
+                            </div>
+                            <label class="byok-remember"><input type="checkbox" id="byokRemember" /> Remember in this browser only</label>
+                            <p class="byok-note">
+                                Enter a model your key can actually access — we don't guess, because a wrong default just fails.
+                                Your key is sent with each request straight to the provider and is never written to our logs or database.
+                                We can't recover it if you lose it.
+                            </p>
+                        </div>
+
+                        <!-- Usage stats -->
+                        <div class="usage-stats">
+                            <span class="stat">
+                                <span class="num">10</span> free analyses / hour
+                            </span>
+                            <span class="stat">
+                                <span class="num">40&ndash;120</span> design values per site
+                            </span>
+                        </div>
+
+                        <!-- BUILD PROMPT CARD — surfaced separately so users can copy
+                             the imperative instruction to paste into v0/Cursor, not the
+                             full markdown spec (which is the design source). Hidden until
+                             we have a real build-prompt from the model. -->
+                        <div class="build-prompt-card" id="buildPromptCard" hidden>
+                            <div class="build-prompt-head">
+                                <span class="build-prompt-label">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                                    Build prompt
+                                </span>
+                                <button class="copy-prompt-btn" id="copyPromptBtn">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                                    Copy
+                                </button>
+                            </div>
+                            <p id="buildPromptText"></p>
+                        </div>
+
+                        <!-- RESULT PANEL -->
+                        <!-- The live region is the STATUS LINE only. Putting
+                             aria-live on the panel itself made screen readers
+                             announce the entire ~4000-char spec on every
+                             analysis; readers navigate the spec manually. -->
+                        <div class="result-panel" id="resultPanel">
+                            <div class="panel-header" role="status" aria-live="polite">
+                                <span class="panel-label" id="resultLabel">Real output · tailwindcss.com</span>
+                                <span class="panel-status" id="resultStatus">Ready</span>
+                            </div>
+                            <div class="byok-warning" id="byokWarning" role="status" aria-live="polite" hidden></div>
+                            <div class="prompt-box" id="promptContent" aria-live="off"></div>
+                            <div class="panel-actions">
+                                <button class="copy-btn" id="copyBtn">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                                    </svg>
+                                    Copy prompt
+                                </button>
+                                <button class="btn-secondary" id="reconstructBtn">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <polyline points="23 4 23 10 17 10"></polyline>
+                                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                                    </svg>
+                                    Try again
+                                </button>
+                            </div>
+                            <div class="panel-note">
+                                Paste this into v0, Bolt, or Cursor to rebuild the layout.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- HOW IT WORKS -->
+        <section class="section-steps" id="steps" aria-labelledby="steps-heading">
+            <div class="container">
+                <h2 class="section-title" id="steps-heading">How it works</h2>
+
+                <div class="steps-grid">
+                    <div class="step-item">
+                        <span class="number">01</span>
+                        <div class="content">
+                            <h3>Paste the URL</h3>
+                            <p>We inspect the site's available HTML/CSS signals and analyse its structure.</p>
+                        </div>
+                    </div>
+
+                    <div class="step-item">
+                        <span class="number">02</span>
+                        <div class="content">
+                            <h3>Extract the spec</h3>
+                            <p>We identify colors, typography, spacing, layout, responsive behaviour, and interaction patterns.</p>
+                        </div>
+                    </div>
+
+                    <div class="step-item">
+                        <span class="number">03</span>
+                        <div class="content">
+                            <h3>Paste into your editor</h3>
+                            <p>Drop the spec into v0, Bolt, Cursor or Lovable and watch it rebuild the layout — no hand-written brief required.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TECHNICAL NOTE -->
+        <section class="section-note" aria-labelledby="note-heading">
+            <div class="container">
+                <blockquote id="note-heading">
+                    We don't read every pixel <span>— yet.</span>
+                </blockquote>
+                <div class="note-body">
+                    <strong>Why we're upfront:</strong> We fetch the page and its linked stylesheets
+                    server-side, then resolve the design tokens and component rules the site actually
+                    ships — including <code>var()</code> and <code>calc()</code> evaluated to concrete
+                    values. We don't run a headless browser, so anything that only exists after
+                    JavaScript paints is outside what we can see.
+                    <br /><br />
+                    This works best for websites where the design is represented through standard HTML/CSS.
+                    Sites that render everything in JavaScript or hash their CSS at build time
+                    (Linear-style apps, canvas-heavy pages) give us far less to read, and we say so
+                    rather than hand you a thin spec that looks confident.
+                </div>
+                <span class="note-tag">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                    Currently optimised for HTML/CSS interfaces
+                </span>
+            </div>
+        </section>
+
+<!-- WHAT YOU GET -->
+        <section class="section-social" aria-labelledby="social-heading">
+            <div class="container">
+                <h2 class="sr-only" id="social-heading">What you get</h2>
+                <div class="testimonials-grid">
+                        <div class="testimonial-card">
+                            <h3>Extracts real design tokens</h3>
+                            <p class="testimonial-text">Colors, type scale, spacing, radii and shadows pulled straight from the page's CSS — not guessed.</p>
+                        </div>
+                        <div class="testimonial-card">
+                            <h3>Build-ready AI prompt</h3>
+                            <p class="testimonial-text">Outputs a structured spec that AI editors (Cursor, v0, Bolt) can implement directly.</p>
+                        </div>
+                        <div class="testimonial-card">
+                            <h3>Analyzes the live page</h3>
+                            <p class="testimonial-text">Fetches the deployed site server-side, so the spec matches what's actually shipped.</p>
+                        </div>
+                </div>
+            </div>
+        </section>
+
+<!-- PRICING -->
+        <section class="section-pricing" id="pricing" aria-labelledby="pricing-heading">
+            <div class="container">
+                <h2 class="section-title" id="pricing-heading">Free while in beta</h2>
+                <p class="pricing-sub">Everything works right now. No account, no card, no locked features.</p>
+
+                <div class="pricing-grid">
+                    <div class="pricing-card">
+                        <div class="plan-label">Beta</div>
+                        <div class="price">
+                            $0
+                        </div>
+                        <div class="plan-desc">Fair use: 10 analyses per hour, enforced server-side.</div>
+                        <ul class="pricing-features">
+                            <li>Full UI spec: colors, type, spacing, layout</li>
+                            <li>Copy as markdown prompt</li>
+                            <li>Works with any public URL</li>
+                        </ul>
+                        <button class="btn-secondary" onclick="document.getElementById('main').scrollIntoView({behavior:'smooth'})">Try it now</button>
+                    </div>
+
+                    <div class="pricing-card pro">
+                        <div class="plan-label">Bring your key</div>
+                        <div class="price">
+                            $0<small> + your AI bill</small>
+                        </div>
+                        <div class="plan-desc">60 analyses per hour on your own OpenAI or Anthropic quota. Your key is sent per request — never stored, never logged.</div>
+                        <ul class="pricing-features">
+                            <li>Everything in Beta, plus 60 runs per hour</li>
+                            <li>Choose your model per run</li>
+                            <li>Key stays in your browser, sent per request</li>
+                        </ul>
+                        <button class="btn-secondary" id="pricingByokBtn" onclick="document.getElementById('byokToggle')&&document.getElementById('byokToggle').click();document.getElementById('main').scrollIntoView({behavior:'smooth'})">Use my own key</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- CTA BANNER -->
+        <section class="section-cta" aria-labelledby="cta-heading">
+            <div class="container">
+                <div class="cta-box">
+                    <div class="cta-content">
+                        <h2 class="cta-title" id="cta-heading">Ready to deconstruct?</h2>
+                        <p class="cta-text">Free while in beta — no account, no card. Bring your own AI key for 60 runs an hour.</p>
+                    </div>
+                    <div class="cta-actions">
+                        <button class="btn-primary cta-btn" id="ctaBtn">
+                            Try it free
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
+                        </button>
+                        <span class="cta-note">No signup required</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- FOOTER -->
+    <footer class="footer" role="contentinfo">
+        <div class="container">
+            <div class="footer-top">
+                <span class="logo">uid<span>construct</span></span>
+                <div class="links">
+                    <a href="/specs/">Design Token Library</a>
+                    <a href="/terms">Terms</a>
+                    <a href="/privacy">Privacy</a>
+                    <a href="https://github.com/al7ameen/uidconstruct" target="_blank" rel="noopener noreferrer">GitHub</a>
+                </div>
+            </div>
+            <div class="author-note">
+              <span class="author-note-label">From the author</span>
+              <span>I build production UIs from specs like these &mdash; <a href="https://www.instagram.com/al7.ameen" target="_blank" rel="noopener noreferrer">get in touch</a>.</span>
+            </div>
+            <div class="footer-bottom">
+                <span class="tagline">No tracking pixels. No cookies. Try it without an account. Not affiliated with or endorsed by the sites analysed; all trademarks belong to their owners.</span>
+                <span class="made-with">Built by <a href="https://github.com/al7ameen" target="_blank" rel="noopener noreferrer">al7ameen</a> <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg> &middot; <a href="https://www.instagram.com/al7.ameen" target="_blank" rel="noopener noreferrer">Instagram</a></span>
+            </div>
+        </div>
+    </footer>
+
+    <!-- JavaScript -->
+    <script defer src="app.js"></script>
+</body>
+</html>

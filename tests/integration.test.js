@@ -1,0 +1,439 @@
+// tests/integration.test.js — the burst-test regression suite.
+//
+// WHY THIS FILE EXISTS. Measured on 2026-09-04: 12 concurrent analyses of one
+// URL returned ZERO successes (7x HTTP 500, 5 timeouts). Every prior test in
+// this repo fired exactly one request at a time, which is why the defect
+// survived until the day before launch. These tests fire many.
+//
+// HOW. global.fetch is replaced with a counting stub, so "how many AI calls did
+// we make" is directly observable. Without that counter, a cache that is read
+// but never written looks identical to a working one -- and that exact bug was
+// present in this codebase mid-refactor.
+
+const assert = require('assert');
+const handler = require('../api/deconstruct.js');
+const { clear } = (() => { try { return require('../lib/cache.js'); } catch { return {}; } })();
+
+const PAGE = '<html><head><style>:root{--color-primary:#123456}</style></head><body><h1 class="text-primary">Hi</h1></body></html>';
+const SPEC = 'BUILD PROMPT\nRebuild example.com with #123456.\n\n## 1. Design Tokens\n\n| Token | Hex |\n|-------|-----|\n| primary | #123456 |\n';
+
+let calls = { page: 0, ai: 0, css: 0 };
+let aiStatus = 200;      // flip to 429 to simulate the saturated free tier
+let aiDelay = 0;
+let aiModels = [];       // which model each attempt asked for
+let statusByModel = {};  // per-model status, to exercise the fallback chain
+let aiRetryAfter = '17'; // provider's Retry-After on a 429; null = header absent
+let aiTimeout = false;   // AI call aborts -> exercises the 504 copy
+let pageBodyTimeout = false; // page headers arrive, body stalls -> separate branch
+
+function installFetch() {
+    global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/chat/completions') || u.includes('/v1/messages')) {
+            calls.ai++;
+            let askedModel = '';
+            try { askedModel = JSON.parse(opts.body).model; } catch (_) {}
+            aiModels.push(askedModel);
+            if (aiDelay) await new Promise(r => setTimeout(r, aiDelay));
+            if (aiTimeout) { const e = new Error('This operation was aborted'); e.name = 'TimeoutError'; throw e; }
+            const st = (askedModel in statusByModel) ? statusByModel[askedModel] : aiStatus;
+            if (st === 401 || st === 403) {
+                return { ok: false, status: st, headers: { get: () => null }, text: async () => 'unauthorized' };
+            }
+            if (st === 429) {
+                // key-aware so the test proves we read the RIGHT header, not just any
+                return { ok: false, status: 429, headers: { get: (k) => (String(k).toLowerCase() === 'retry-after' ? aiRetryAfter : null) }, text: async () => 'slow down' };
+            }
+            return {
+                ok: true, status: 200,
+                json: async () => ({ choices: [{ message: { content: SPEC } }], content: [{ text: SPEC }] })
+            };
+        }
+        if (/\.css(\?|$)/.test(u)) { calls.css++; return { ok: true, status: 200, headers: { get: (k) => k === 'content-type' ? 'text/css' : null }, text: async () => ':root{--color-primary:#123456}' }; }
+        calls.page++;
+        if (pageBodyTimeout) {
+            return {
+                ok: true, status: 200, headers: { get: () => 'text/html' },
+                text: async () => { const e = new Error('This operation was aborted'); e.name = 'TimeoutError'; throw e; }
+            };
+        }
+        return { ok: true, status: 200, headers: { get: () => 'text/html' }, text: async () => PAGE };
+    };
+}
+
+function mockRes() {
+    const res = { statusCode: 0, body: null, headers: {} };
+    res.status = (c) => { res.statusCode = c; return res; };
+    res.json = (o) => { res.body = o; return res; };
+    res.setHeader = (k, v) => { res.headers[k] = v; };
+    res.end = () => res;
+    return res;
+}
+
+function post(url, ip) {
+    const req = { method: 'POST', headers: { 'x-forwarded-for': ip || '10.0.0.1' }, body: { url } };
+    const res = mockRes();
+    return handler(req, res).then(() => res);
+}
+
+const results = [];
+function check(name, fn) {
+    try { fn(); results.push([true, name, '']); }
+    catch (e) { results.push([false, name, e.message]); }
+}
+
+(async () => {
+    installFetch();
+    process.env.OPENAI_API_KEY = 'test-key-aaaaaaaaaaaaaaaaaaaa';
+
+    // ---- 1. the cache must actually be WRITTEN, not just read ----
+    await post('https://example.com');
+    check('first analysis makes exactly one AI call', () =>
+        assert.strictEqual(calls.ai, 1, 'AI calls=' + calls.ai));
+
+    calls = { page: 0, ai: 0, css: 0 };
+    const second = await post('https://example.com');
+    check('repeat analysis makes ZERO AI calls (cache is populated, not read-only)', () => {
+        assert.strictEqual(calls.ai, 0, 'AI calls=' + calls.ai + ' -- cache never written');
+        assert.strictEqual(second.statusCode, 200);
+        assert.ok(second.body.cached === true, 'expected cached:true flag');
+    });
+
+    // ---- 2. the actual launch-day shape: N simultaneous duplicates ----
+    calls = { page: 0, ai: 0, css: 0 };
+    if (clear) clear();
+    const burst = await Promise.all(Array.from({ length: 12 }, (_, i) =>
+        post('https://vercel.com', '203.0.113.' + i)));   // distinct IPs: defeat the per-IP limiter, exercise coalescing
+    const okCount = burst.filter(r => r.statusCode === 200).length;
+    check('12 concurrent duplicates all succeed', () =>
+        assert.strictEqual(okCount, 12, 'successes=' + okCount + ' of 12'));
+    check('12 concurrent duplicates collapse to ONE AI call', () =>
+        assert.strictEqual(calls.ai, 1, 'AI calls=' + calls.ai + ' (expected 1 via coalescing)'));
+
+    // ---- 3. a saturated provider must not look like our outage ----
+    calls = { page: 0, ai: 0, css: 0 };
+    if (clear) clear();
+    aiStatus = 429;
+    aiRetryAfter = '17';
+    const limited = await post('https://stripe.com');
+    check('upstream 429 becomes HTTP 429, never 500', () =>
+        assert.strictEqual(limited.statusCode, 429, 'got ' + limited.statusCode));
+    // Regression in the TEST itself: this assertion used to be
+    //   assert.ok(limited.headers['Retry-After'])
+    // which a hardcoded `30` would satisfy. lib/ai.js deliberately honours the
+    // provider's own value and clamps absurd ones -- an assertion that cannot
+    // tell those three behaviours apart tests nothing. Pin the value.
+    check('429 forwards the provider OWN Retry-After, not a constant', () =>
+        assert.strictEqual(limited.headers['Retry-After'], '17',
+            'got ' + JSON.stringify(limited.headers['Retry-After'])));
+    check('the human-readable wait matches the header', () =>
+        assert.ok(/about 17 seconds/i.test(limited.body.error),
+            'header says 17s but the message says: ' + limited.body.error));
+    check('429 message tells the user what to do, not that we are broken', () =>
+        assert.ok(/try again|own API key/i.test(limited.body.error), limited.body.error));
+
+    // ---- 3b. a provider that lies about how long to wait must not be obeyed ----
+    aiRetryAfter = '99999';
+    const absurd = await post('https://stripe.com', '10.0.0.141');
+    check('an absurd provider Retry-After is clamped to our 30s default', () =>
+        assert.strictEqual(absurd.headers['Retry-After'], '30',
+            'got ' + absurd.headers['Retry-After'] + ' -- "come back in 27 hours" ends the session'));
+
+    // ---- 3c. header absent -> numeric default, never NaN/undefined ----
+    aiRetryAfter = null;
+    const noRa = await post('https://stripe.com', '10.0.0.142');
+    check('a 429 with no Retry-After header still gets a numeric default', () =>
+        assert.strictEqual(noRa.headers['Retry-After'], '30',
+            'got ' + JSON.stringify(noRa.headers['Retry-After'])));
+    aiRetryAfter = '17';
+    aiStatus = 200;
+
+    // ---- 4. failures must not be cached ----
+    calls = { page: 0, ai: 0, css: 0 };
+    if (clear) clear();
+    aiStatus = 429;
+    await post('https://github.com');
+    aiStatus = 200;
+    const after = await post('https://github.com');
+    check('a failed analysis is not cached (next visitor gets a real attempt)', () => {
+        assert.strictEqual(after.statusCode, 200, 'got ' + after.statusCode);
+        assert.strictEqual(after.body.cached, false, 'served a cached failure');
+    });
+
+    // ---- 5. BYOK results must never leak to free-tier visitors ----
+    calls = { page: 0, ai: 0, css: 0 };
+    if (clear) clear();
+    await post('https://news.ycombinator.com');
+    const byokRes = await (() => {
+        const req = { method: 'POST', headers: { 'x-forwarded-for': '10.0.0.9' }, body: {
+            url: 'https://news.ycombinator.com',
+            byok: { provider: 'openai', model: 'gpt-5.2', key: 'sk-' + 'x'.repeat(40) }
+        } };
+        const res = mockRes();
+        return handler(req, res).then(() => res);
+    })();
+    check('BYOK run is not served from the free-tier cache entry', () => {
+        assert.strictEqual(byokRes.body.cached, false, 'BYOK reused a free-tier cached spec');
+    });
+
+    // ---- 6. free-tier fallback: primary saturated, spare model saves the run ----
+    calls = { page: 0, ai: 0, css: 0 }; aiModels = []; statusByModel = {};
+    if (clear) clear();
+    process.env.OPENAI_MODEL = 'qwen3.8-flash';
+    delete require.cache[require.resolve('../lib/ai.js')];   // CONFIG.MODEL is read at module load
+    const freshHandler = (() => { delete require.cache[require.resolve('../api/deconstruct.js')]; return require('../api/deconstruct.js'); })();
+    const postFresh = (url, ip) => {
+        const req = { method: 'POST', headers: { 'x-forwarded-for': ip || '10.0.0.1' }, body: { url } };
+        const res = mockRes();
+        return freshHandler(req, res).then(() => res);
+    };
+    statusByModel['qwen3.8-flash'] = 429;      // primary bucket saturated
+    statusByModel['glm-5.3-flash'] = 200;      // different bucket, still free
+    const fb = await postFresh('https://fallback-test.example');
+    check('free tier falls back to the second model and still returns 200', () => {
+        assert.strictEqual(fb.statusCode, 200, 'got ' + fb.statusCode + ': ' + JSON.stringify(fb.body));
+        assert.deepStrictEqual(aiModels, ['qwen3.8-flash', 'glm-5.3-flash'], 'attempted ' + JSON.stringify(aiModels));
+    });
+
+    // ---- 7. every free model saturated -> honest 429, never a 500 ----
+    calls = { page: 0, ai: 0, css: 0 }; aiModels = []; statusByModel = {};
+    if (clear) clear();
+    aiStatus = 429;
+    const allDead = await postFresh('https://all-busy.example');
+    check('all free models 429 -> HTTP 429 (not 500)', () =>
+        assert.strictEqual(allDead.statusCode, 429, 'got ' + allDead.statusCode));
+    check('we tried more than one model before giving up', () =>
+        assert.ok(aiModels.length >= 2, 'only tried ' + JSON.stringify(aiModels)));
+    check('giving up still tells the user how to proceed', () =>
+        assert.ok(/try again|own API key/i.test(allDead.body.error), allDead.body.error));
+    aiStatus = 200; statusByModel = {};
+
+    // ---- 8. BYOK must NEVER be silently swapped to another model ----
+    calls = { page: 0, ai: 0, css: 0 }; aiModels = []; statusByModel = {};
+    if (clear) clear();
+    aiStatus = 429;
+    const byokReq = { method: 'POST', headers: { 'x-forwarded-for': '10.0.0.55' }, body: {
+        url: 'https://byok-busy.example',
+        byok: { provider: 'openai', model: 'gpt-5.2', key: 'sk-' + 'x'.repeat(40) }
+    } };
+    const byokRes2 = mockRes();
+    await freshHandler(byokReq, byokRes2);
+    check('BYOK 429 does NOT fall back to a different model', () => {
+        assert.deepStrictEqual(aiModels, ['gpt-5.2'], 'attempted ' + JSON.stringify(aiModels) + ' -- silently changing a user-chosen model is a lie about provenance');
+    });
+    check('BYOK 429 returns 429 with the provider Retry-After', () => {
+        assert.strictEqual(byokRes2.statusCode, 429, 'got ' + byokRes2.statusCode);
+        assert.strictEqual(byokRes2.headers['Retry-After'], '17',
+            'got ' + JSON.stringify(byokRes2.headers['Retry-After']));
+    });
+    check('BYOK message is about THEIR key, not our queue', () => {
+        assert.ok(/your ai provider|your key/i.test(byokRes2.body.error), byokRes2.body.error);
+        assert.ok(!/our free/i.test(byokRes2.body.error), 'blamed our queue for the user\'s own quota');
+    });
+    aiStatus = 200;
+
+    // ---- 9. OUR key being bad must never be reported as the visitor's fault.
+    // Regression: a 401 from the relay threw ByokAuthError regardless of
+    // whether the user had supplied a key, so an unconfigured or rotated
+    // free-tier key made every visitor read "Your API key was rejected" about a
+    // key they never entered.
+    const reload = () => {
+        delete require.cache[require.resolve('../lib/ai.js')];
+        delete require.cache[require.resolve('../lib/cache.js')];
+        delete require.cache[require.resolve('../api/deconstruct.js')];
+        return require('../api/deconstruct.js');
+    };
+    const KEY = process.env.OPENAI_API_KEY;
+
+    // 9a. key absent -> refuse before spending a network round trip
+    process.env.OPENAI_API_KEY = '';
+    calls = { page: 0, ai: 0, css: 0 };
+    const noKeyH = reload();
+    const noKey = await (() => {
+        const res = mockRes();
+        return noKeyH({ method: 'POST', headers: { 'x-forwarded-for': '10.0.0.71' }, body: { url: 'https://nokey.example' } }, res).then(() => res);
+    })();
+    check('missing free-tier key returns 503, not a 401 blaming the visitor', () =>
+        assert.strictEqual(noKey.statusCode, 503, 'got ' + noKey.statusCode + ': ' + JSON.stringify(noKey.body)));
+    check('missing key is caught before any AI request is made', () =>
+        assert.strictEqual(calls.ai, 0, 'made ' + calls.ai + ' AI calls with no key configured'));
+    check('missing-key message never mentions the visitor having a key', () => {
+        assert.ok(!/your api key was rejected/i.test(noKey.body.error), noKey.body.error);
+        assert.ok(/own api key/i.test(noKey.body.error), 'should offer BYOK as the way out: ' + noKey.body.error);
+    });
+
+    // 9b. key present but REJECTED by the provider (rotation / expiry)
+    process.env.OPENAI_API_KEY = KEY;
+    calls = { page: 0, ai: 0, css: 0 }; aiStatus = 401;
+    const rejH = reload();
+    const rejected = await (() => {
+        const res = mockRes();
+        return rejH({ method: 'POST', headers: { 'x-forwarded-for': '10.0.0.72' }, body: { url: 'https://rejected.example' } }, res).then(() => res);
+    })();
+    check('provider 401 on the FREE tier becomes 503, not 401', () =>
+        assert.strictEqual(rejected.statusCode, 503, 'got ' + rejected.statusCode + ': ' + JSON.stringify(rejected.body)));
+    check('free-tier 401 does not tell the visitor their key was rejected', () =>
+        assert.ok(!/your api key was rejected/i.test(rejected.body.error), rejected.body.error));
+    aiStatus = 200;
+
+    // 9c. a genuine BYOK 401 must STILL be a 401 about their key -- the fix
+    // must not swallow the case it was originally written for.
+    calls = { page: 0, ai: 0, css: 0 }; aiStatus = 401;
+    const byokBad = await (() => {
+        const res = mockRes();
+        return rejH({ method: 'POST', headers: { 'x-forwarded-for': '10.0.0.73' }, body: {
+            url: 'https://byok-bad.example',
+            byok: { provider: 'openai', model: 'gpt-5.2', key: 'sk-bad-' + 'y'.repeat(36) }
+        } }, res).then(() => res);
+    })();
+    check('BYOK 401 still returns 401 about THEIR key', () => {
+        assert.strictEqual(byokBad.statusCode, 401, 'got ' + byokBad.statusCode);
+        assert.ok(/your api key was rejected/i.test(byokBad.body.error), byokBad.body.error);
+    });
+    aiStatus = 200;
+    process.env.OPENAI_API_KEY = KEY;
+
+    // ---- 10. timeout ATTRIBUTION. Measured 2026-09-04: example.com analyzes in
+    // 17.3s on the free tier but exceeds 55s through BYOK, because the BYOK path
+    // omits reasoning_effort:'low' and runs a reasoning model at full effort. The
+    // old 504 told those users to "use a faster site" -- wrong diagnosis, sent
+    // them to fix the thing that was not broken. These tests lock the copy.
+    const postByok = (url, ip, byok) => {
+        const res = mockRes();
+        return handler({ method: 'POST', headers: { 'x-forwarded-for': ip }, body: { url, byok } }, res).then(() => res);
+    };
+
+    if (clear) clear();
+    aiTimeout = true;
+    const freeTO = await post('https://ai-timeout-free.example', '198.51.100.11');
+    const byokTO = await postByok('https://ai-timeout-byok.example', '198.51.100.12',
+        { provider: 'openai', model: 'o3-pro', key: 'sk-to-' + 'z'.repeat(36) });
+    aiTimeout = false;
+
+    check('AI timeout is a 504, not a 500', () => {
+        assert.strictEqual(freeTO.statusCode, 504, 'got ' + freeTO.statusCode + ': ' + JSON.stringify(freeTO.body));
+        assert.strictEqual(byokTO.statusCode, 504, 'got ' + byokTO.statusCode + ': ' + JSON.stringify(byokTO.body));
+    });
+    check('timeout copy no longer tells users to use a faster site', () => {
+        assert.ok(!/faster site/i.test(freeTO.body.error), freeTO.body.error);
+        assert.ok(!/faster site/i.test(byokTO.body.error), byokTO.body.error);
+    });
+    check('BYOK timeout names the model the user chose', () => {
+        assert.ok(/o3-pro/.test(byokTO.body.error), byokTO.body.error);
+    });
+    check('BYOK timeout suggests the real fix (a faster model), free tier does not', () => {
+        assert.ok(/faster model/i.test(byokTO.body.error), byokTO.body.error);
+        assert.ok(!/faster model/i.test(freeTO.body.error), 'free tier has no model to change: ' + freeTO.body.error);
+    });
+    check('free-tier timeout owns it as our AI, not the visitor\'s site', () => {
+        assert.ok(/our ai did not finish/i.test(freeTO.body.error), freeTO.body.error);
+    });
+    check('timeout message does not leak the API key', () => {
+        assert.ok(!/sk-to-/.test(byokTO.body.error), byokTO.body.error);
+    });
+
+    // 10b. the body-read stall: headers arrive, the body never does. This used to
+    // fall through to the AI branch and blame our model for the site's delay.
+    if (clear) clear();
+    pageBodyTimeout = true;
+    const bodyTO = await post('https://body-stall.example', '198.51.100.13');
+    pageBodyTimeout = false;
+
+    check('a stalled page body is a 504 about the SITE, not the model', () => {
+        assert.strictEqual(bodyTO.statusCode, 504, 'got ' + bodyTO.statusCode + ': ' + JSON.stringify(bodyTO.body));
+        assert.ok(/stalled partway/i.test(bodyTO.body.error), bodyTO.body.error);
+        assert.ok(!/our ai|your model/i.test(bodyTO.body.error), 'misattributed to AI: ' + bodyTO.body.error);
+    });
+
+
+    // ---- 11. BYOK REJECTION NOTICE. Measured live 2026-09-04: pasting
+    // http://api.openai.com/v1 (plain http, the most common paste error there
+    // is) returned HTTP 200 with a real spec built by OUR free-tier key. The
+    // user had no way to learn their key was never used. diagnoseByok names the
+    // rejection; these tests lock the wiring AND the cache boundary.
+    const { diagnoseByok } = require('../lib/ai.js');
+    const GOOD_KEY = 'sk-good-' + 'k'.repeat(34);
+
+    check('diagnoseByok: null for a valid payload and for an untouched panel', () => {
+        assert.strictEqual(diagnoseByok(null), null, 'null raw must be silent');
+        assert.strictEqual(diagnoseByok({}), null, 'empty object must be silent');
+        assert.strictEqual(diagnoseByok({ provider: 'openai', model: '', key: '   ' }), null,
+            'no key = panel left open, must not nag');
+        assert.strictEqual(diagnoseByok({ provider: 'openai', model: 'gpt-4o-mini', key: GOOD_KEY }), null,
+            'valid payload must not warn');
+    });
+    check('diagnoseByok: plain-http base url says https and that the key was not sent', () => {
+        const m = diagnoseByok({ provider: 'custom', baseUrl: 'http://api.openai.com/v1', key: GOOD_KEY, model: 'x/y' });
+        assert.ok(m, 'expected a message');
+        assert.ok(/https:\/\//i.test(m), m);
+        assert.ok(/NOT sent/i.test(m), 'must reassure the key did not travel: ' + m);
+    });
+    check('diagnoseByok: private address and missing url get distinct messages', () => {
+        const priv = diagnoseByok({ provider: 'custom', baseUrl: 'https://10.0.0.5/v1', key: GOOD_KEY, model: 'x/y' });
+        assert.ok(priv && /private or internal/i.test(priv), priv);
+        const none = diagnoseByok({ provider: 'custom', baseUrl: '', key: GOOD_KEY, model: 'x/y' });
+        assert.ok(none && /needs a base url/i.test(none), none);
+    });
+    check('diagnoseByok: short key, unknown provider, missing model each named', () => {
+        assert.ok(/too short/i.test(diagnoseByok({ provider: 'openai', model: 'gpt-4o-mini', key: 'abc' })), 'short key');
+        assert.ok(/unknown provider/i.test(diagnoseByok({ provider: 'nope', model: 'm', key: GOOD_KEY })), 'provider');
+        assert.ok(/model name/i.test(diagnoseByok({ provider: 'openai', model: '', key: GOOD_KEY })), 'model');
+    });
+    check('diagnoseByok NEVER echoes the key (it interpolates user input)', () => {
+        for (const raw of [
+            { provider: 'custom', baseUrl: 'http://api.openai.com/v1', key: GOOD_KEY, model: 'x/y' },
+            { provider: 'custom', baseUrl: 'https://10.0.0.5/v1', key: GOOD_KEY, model: 'x/y' },
+            { provider: 'openai', model: 'gpt-4o-mini', key: 'short' },
+            { provider: 'nope', model: 'm', key: GOOD_KEY }]) {
+            const m = diagnoseByok(raw) || '';
+            assert.ok(!m.includes(GOOD_KEY), 'key leaked into: ' + m);
+            assert.ok(!m.includes('sk-good'), 'key fragment leaked: ' + m);
+        }
+    });
+
+    // The seam this whole section depends on. If clear() were silently missing,
+    // the leak test below would pass for the wrong reason -- that exact trap has
+    // bitten this suite twice, so assert it rather than assume it.
+    check('cache seam is real before we rely on it', () => {
+        assert.strictEqual(typeof clear, 'function', 'lib/cache.js does not export clear()');
+    });
+
+    if (clear) clear();
+    const LEAK_URL = 'https://warn-leak.example';
+    const badByok = { provider: 'custom', baseUrl: 'http://api.openai.com/v1', key: GOOD_KEY, model: 'x/y' };
+    const warned = await postByok(LEAK_URL, '198.51.100.21', badByok);
+    const cleanFree = await post(LEAK_URL, '198.51.100.22');
+    const cleanByok = await postByok('https://warn-ok.example', '198.51.100.23',
+        { provider: 'openai', model: 'gpt-4o-mini', key: GOOD_KEY });
+
+    check('a rejected key still succeeds but says so', () => {
+        assert.strictEqual(warned.statusCode, 200, JSON.stringify(warned.body).slice(0, 160));
+        assert.ok(warned.body.prompt, 'no prompt');
+        assert.ok(warned.body.byokWarning, 'expected byokWarning, got: ' + JSON.stringify(warned.body).slice(0, 160));
+        assert.ok(/NOT sent/i.test(warned.body.byokWarning), warned.body.byokWarning);
+    });
+    check('a valid key gets no warning', () => {
+        assert.strictEqual(cleanByok.statusCode, 200);
+        assert.ok(!cleanByok.body.byokWarning, 'unexpected warning: ' + cleanByok.body.byokWarning);
+    });
+    check('free tier gets no warning', () => {
+        assert.ok(!cleanFree.body.byokWarning, 'unexpected warning: ' + cleanFree.body.byokWarning);
+    });
+    // THE reason byokWarning is computed per-request and never stored: a rejected
+    // BYOK produces the FREE-TIER cache key, so a warning inside the cached value
+    // would be served to people who never touched the panel.
+    check('the warning cannot cross the cache to a genuine free-tier user', () => {
+        assert.strictEqual(cleanFree.body.cached, true,
+            'second request should be a cache hit or the test proves nothing (cached=' + cleanFree.body.cached + ')');
+        assert.ok(!cleanFree.body.byokWarning,
+            'LEAK: free-tier user inherited another user\'s BYOK warning: ' + cleanFree.body.byokWarning);
+    });
+
+    let failed = 0;
+    for (const [ok, name, msg] of results) {
+        console.log((ok ? '  ok  ' : ' FAIL ') + name + (ok ? '' : '  <-- ' + msg));
+        if (!ok) failed++;
+    }
+    console.log('\n' + (results.length - failed) + '/' + results.length + ' integration tests passed');
+    process.exit(failed ? 1 : 0);
+})().catch(e => { console.error('HARNESS ERROR:', e && e.stack || e); process.exit(1); });

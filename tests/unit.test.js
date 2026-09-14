@@ -1,0 +1,1212 @@
+#!/usr/bin/env node
+/**
+ * Offline regression tests for the parts of api/deconstruct.js that decide
+ * spec quality, plus the frontend markdown renderer.
+ *
+ * Why this exists: three bugs in a row were introduced *while patching* this
+ * file (a duplicate const, an exponential string growth in resolveVars, and a
+ * SYSTEM_PROMPT that contradicted USER_PROMPT). None were caught by reading
+ * the diff. These tests are the cheap net.
+ *
+ * Run: node tests/unit.test.js      (no network, no deps beyond cheerio)
+ */
+const fs = require('fs');
+const path = require('path');
+const assert = require('assert');
+const cheerio = require('cheerio');
+
+const ROOT = path.join(__dirname, '..');
+const appSrc = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
+
+// Backend: the analysis engine now lives in lib/ as real CommonJS modules, so
+// we require() it directly. (Before the split, api/deconstruct.js was one
+// 1086-line file with no exports, which forced this suite to locate functions
+// by string marker and eval() them — 17 brittle slices, and the reason three
+// bugs shipped through that file unnoticed.)
+const NET = require(path.join(ROOT, 'lib', 'net.js'));
+const MINE = require(path.join(ROOT, 'lib', 'mine.js'));
+const EXTRACT = require(path.join(ROOT, 'lib', 'extract.js'));
+const PROMPTS = require(path.join(ROOT, 'lib', 'prompts.js'));
+const AI = require(path.join(ROOT, 'lib', 'ai.js'));
+const CACHE = require(path.join(ROOT, 'lib', 'cache.js'));
+const CSS = require(path.join(ROOT, 'lib', 'css.js'));
+const PIPELINE = require(path.join(ROOT, 'lib', 'pipeline.js'));
+
+// Frontend is a browser IIFE with no module system, so it still has to be
+// sliced. Kept deliberately narrow: escapeHtml/renderMarkdown/inlineMd and the
+// URL helpers are pure and take/return strings.
+function slice(src, startMark, endMark, exports) {
+    const a = src.indexOf(startMark), b = src.indexOf(endMark);
+    assert.ok(a >= 0, 'missing start marker: ' + startMark);
+    assert.ok(b > a, 'missing end marker: ' + endMark);
+    return new Function(src.slice(a, b) + '\nreturn {' + exports + '};')();
+}
+const FE = slice(appSrc, 'function escapeHtml', '// ============================================================\n    // COPY TO CLIPBOARD',
+    'renderMarkdown,escapeHtml,inlineMd');
+const SEC = NET;
+const API = MINE;
+
+let pass = 0, fail = 0;
+function t(name, fn) {
+    try { fn(); pass++; console.log('  ok   ' + name); }
+    catch (e) { fail++; console.log('  FAIL ' + name + '\n         ' + e.message.split('\n')[0]); }
+}
+function section(s) { console.log('\n' + s); }
+
+section('module structure (post-refactor contract)');
+// api/deconstruct.js was 1086 lines with a single export (maxDuration), which
+// made the analysis engine untestable. It is now lib/*.js. These assertions
+// keep the split honest: if someone inlines a module back into the handler, or
+// drops an export, this fails loudly instead of silently reducing coverage.
+const LIB = ['net', 'rate', 'extract', 'css', 'mine', 'prompts', 'ai', 'pipeline'];
+t('every lib module loads and exports something', () => {
+    LIB.forEach(m => {
+        const mod = require(path.join(ROOT, 'lib', m + '.js'));
+        assert.ok(Object.keys(mod).length > 0, m + '.js exports nothing');
+    });
+});
+t('the endpoint still exports maxDuration (Vercel kills the fn without it)', () => {
+    const handler = require(path.join(ROOT, 'api', 'deconstruct.js'));
+    assert.strictEqual(handler.maxDuration, 180);
+    assert.strictEqual(typeof handler, 'function');
+});
+t('the handler is thin again (regression guard against re-inlining)', () => {
+    const h = fs.readFileSync(path.join(ROOT, 'api', 'deconstruct.js'), 'utf8');
+    assert.ok(h.split('\n').length < 400,
+        'api/deconstruct.js is ' + h.split('\n').length + ' lines; analysis code belongs in lib/');
+});
+t('SSRF surface is reachable from exactly one module', () => {
+    assert.strictEqual(typeof NET.sanitizeUrl, 'function');
+    assert.strictEqual(typeof NET.safeFetch, 'function');
+    assert.strictEqual(typeof NET.BlockedUrlError, 'function');
+});
+
+section('SSRF guard');
+t('blocks loopback + private + metadata', () => {
+    ['http://127.0.0.1/', 'http://localhost/x', 'http://169.254.169.254/latest/meta-data/',
+     'http://10.1.2.3/', 'http://192.168.0.1/', 'http://172.16.0.1/', 'http://[::1]/',
+     'http://metadata.google.internal/'].forEach(u =>
+        assert.strictEqual(SEC.sanitizeUrl(u), null, 'should block ' + u));
+});
+t('allows public http(s) and normalises without dropping the path', () => {
+    assert.strictEqual(SEC.sanitizeUrl('https://example.com'), 'https://example.com/');
+    assert.strictEqual(SEC.sanitizeUrl('http://tailwindcss.com/x'), 'http://tailwindcss.com/x');
+    assert.strictEqual(SEC.sanitizeUrl('https://example.com/a?b=1#c'), 'https://example.com/a?b=1#c');
+});
+t('blocks embedded credentials', () =>
+    assert.strictEqual(SEC.sanitizeUrl('https://u:p@example.com'), null));
+t('blocks non-http protocols', () => {
+    ['file:///etc/passwd', 'gopher://127.0.0.1/', 'javascript:alert(1)'].forEach(u =>
+        assert.strictEqual(SEC.sanitizeUrl(u), null, 'should block ' + u));
+});
+
+section('calc evaluation');
+const calc = [
+    ['calc(0.25rem*3)', '0.75rem'],
+    ['calc(0.25rem * 3)', '0.75rem'],
+    ['calc(24px + 8px)', '32px'],
+    ['calc(100px / 4)', '25px'],
+    ['calc(100% - 2rem)', 'calc(100% - 2rem)'],
+    ['calc(1rem + 8px)', 'calc(1rem + 8px)'],
+    ['calc(1px * 2px)', 'calc(1px * 2px)'],
+    ['calc(8px / 0)', 'calc(8px / 0)'],
+    ['calc(env(safe) * 2)', 'calc(env(safe) * 2)'],
+    ['calc(var(--x) * 4)', 'calc(var(--x) * 4)'],
+];
+calc.forEach(([inp, want]) =>
+    t(inp + ' -> ' + want, () => assert.strictEqual(API.evalCalc(inp), want)));
+
+section('var() resolution');
+t('resolves a known token', () => {
+    const tk = API.collectTokens(':root{--a:10px}');
+    assert.strictEqual(API.resolveVars('var(--a)', tk, 0), '10px');
+});
+t('uses the fallback for an unknown token', () => {
+    const tk = API.collectTokens(':root{--a:10px}');
+    assert.strictEqual(API.resolveVars('var(--zzz, 5px)', tk, 0), '5px');
+});
+// Regression: this returned the whole accumulated string, so each recursion
+// pass grew the value and the request hung past 45s.
+t('unresolvable var returns the ORIGINAL MATCH, not the whole string', () => {
+    const tk = API.collectTokens(':root{--a:10px}');
+    const v = 'url(/x) var(--zzz) something-long-and-repeated-here';
+    assert.strictEqual(API.resolveVars(v, tk, 0), v);
+});
+t('resolves var inside calc', () => {
+    const tk = API.collectTokens(':root{--sp:.25rem}');
+    assert.strictEqual(API.resolveVars('calc(var(--sp) * 4)', tk, 0), '1rem');
+});
+t('adjacent var() calls keep their separator after substitution', () => {
+    // Minified CSS legally omits the space between two functions:
+    // padding:var(--a)var(--b). Substitute both values with no separator and you
+    // get `8px12px` \u2014 ONE malformed token, not two lengths. This shipped to a
+    // builder inside a block our own header calls "verbatim, use exact values".
+    const tk = API.collectTokens(':root{--sp-8:8px;--sp-12:12px;--sp-0:0}');
+    assert.strictEqual(API.resolveVars('var(--sp-8)var(--sp-12)', tk, 0), '8px 12px');
+    assert.strictEqual(API.resolveVars('var(--sp-8)var(--sp-0)', tk, 0), '8px 0');
+    // and no spurious space when the var() is not adjacent to a function
+    assert.strictEqual(API.resolveVars('var(--sp-8)', tk, 0), '8px');
+});
+
+
+section('design-token mining');
+const TAILWINDISH = `:root{
+  --color-gray-950:#030712;--color-gray-900:#111827;--color-gray-800:#1f2937;--color-gray-300:#d1d5db;
+  --color-sky-400:#00bcfe;--color-indigo-600:#4f39f6;--color-pink-400:#fb64b6;
+  --text-xs:.75rem;--text-sm:.875rem;--text-base:1rem;--text-lg:1.125rem;--text-3xl:1.875rem;
+  --radius-sm:.25rem;--radius-md:.375rem;--radius-lg:.5rem;
+  --shadow-sm:0 1px 2px rgb(0 0 0/.05);--spacing:.25rem;--blur-sm:8px;
+  --tw-translate-x:0;--el-color-primary:red;
+}`;
+const USED = new Set(['bg-gray-950', 'text-gray-300', 'text-sm', 'rounded-lg', 'shadow-sm', 'p-4', 'hover:bg-indigo-600', 'text-3xl', 'blur-sm']);
+const mined = API.mineDesignTokens(TAILWINDISH, USED);
+const flat = mined.join('\n');
+t('every category gets representation (the old global slice gave colours all 40)', () => {
+    ['[color]', '[type]', '[geometry]'].forEach(h => assert.ok(flat.includes(h), 'missing ' + h));
+});
+t('radius + shadow + spacing survive a colour-heavy site', () => {
+    assert.ok(/--radius-lg/.test(flat), 'radius dropped');
+    assert.ok(/--shadow-sm/.test(flat), 'shadow dropped');
+    assert.ok(/--spacing/.test(flat), 'spacing dropped');
+});
+t('framework plumbing tokens are excluded', () => {
+    assert.ok(!/--tw-/.test(flat), '--tw-* leaked');
+    assert.ok(!/--el-/.test(flat), '--el-* leaked');
+});
+t('output stays within budget', () =>
+    assert.ok(mined.filter(l => /--/.test(l)).length <= 44, 'too many tokens'));
+t('--text-primary is classified as colour, --text-xl as type', () => {
+    assert.strictEqual(API.tokenCategory('--text-primary', '#fff'), 'color');
+    assert.strictEqual(API.tokenCategory('--text-xl', '1.25rem'), 'type');
+});
+
+section('component rule resolver');
+const CSS2 = `
+:root{--brand:#4f39f6;--r:.375rem;--sp:.25rem;--sh:0 1px 2px rgb(0 0 0/.05)}
+.btn{background-color:var(--brand);border-radius:var(--r);padding:calc(var(--sp)*3);box-shadow:var(--sh)}
+.card{background:#0a0a0a;padding:24px}
+.widget-unused{background:#123456;padding:99px}
+@media (min-width:768px){.btn{padding:32px}}
+`;
+const rules = API.mineComponentStyles(CSS2, new Set(['btn', 'card']), API.collectTokens(CSS2));
+const rj = rules.join('\n');
+t('resolves var() and calc() to concrete values', () => {
+    assert.ok(/background-color:#4f39f6/.test(rj), 'brand not resolved');
+    assert.ok(/border-radius:\.375rem/.test(rj), 'radius not resolved');
+    assert.ok(/padding:0\.75rem/.test(rj), 'calc not evaluated');
+    assert.ok(/box-shadow:0 1px 2px/.test(rj), 'shadow not resolved');
+});
+t('skips rules whose classes are not on the page', () =>
+    assert.ok(!/widget-unused/.test(rj), 'unused class leaked'));
+t('keeps @media overrides', () => assert.ok(/padding:32px/.test(rj), 'media rule lost'));
+t('never emits empty-value junk lines', () =>
+    assert.ok(!/:\s*;|:\s*\}/.test(rj), 'empty declaration present'));
+t('numeric utility families are capped, not listed exhaustively', () => {
+    const many = Array.from({ length: 30 }, (_, i) => `.size-${i}{width:${i}px;height:${i}px}`).join('\n');
+    const out = API.mineComponentStyles(many, new Set(Array.from({ length: 30 }, (_, i) => 'size-' + i)), new Map());
+    assert.ok(out.length <= 3, 'got ' + out.length + ' near-duplicates');
+});
+
+section('markdown renderer (frontend)');
+const MD = `# UI Specification: example.com
+
+## 1. Design Tokens
+
+### Color Palette
+| Token | Hex | Use |
+|-------|-----|-----|
+| bg | \`#030712\` | page background |
+
+- first bullet
+- second bullet
+
+1. step one
+2. step two
+
+**bold** and \`code\`
+`;
+const html = FE.renderMarkdown(MD);
+t('headings become h tags', () => {
+    assert.ok(/<h1>UI Specification/.test(html));
+    assert.ok(/<h2>1\. Design Tokens<\/h2>/.test(html));
+    assert.ok(/<h3>Color Palette<\/h3>/.test(html));
+});
+t('no raw markdown markers left in output', () => {
+    assert.ok(!/^#{1,6}\s/m.test(html), 'literal heading markers remain');
+    assert.ok(!/<h\d>/.test(html.replace(/<h\d>[^<]*<\/h\d>/g, '')), 'stray heading text');
+});
+t('GFM table renders with thead/tbody', () => {
+    assert.ok(/<table><thead><tr><th>Token<\/th>/.test(html), 'no thead');
+    // Cells run through the inline pass, so a backticked value becomes <code>.
+    assert.ok(/<td><code>#030712<\/code><\/td>/.test(html), 'no cell content');
+    assert.ok(!/^\|/m.test(html), 'pipe rows leaked into output');
+});
+t('lists render', () => {
+    assert.ok(/<ul><li>first bullet<\/li>/.test(html), 'ul missing');
+    assert.ok(/<ol><li>step one<\/li>/.test(html), 'ol missing');
+});
+t('inline code and bold render', () => {
+    assert.ok(/<code>#030712<\/code>/.test(html), 'code missing');
+    assert.ok(/<strong>bold<\/strong>/.test(html), 'strong missing');
+});
+// The model's output is untrusted text rendered into the page.
+t('escapes script tags (no HTML injection from model output)', () => {
+    const evil = FE.renderMarkdown('# t\n<script>alert(1)</script>\n<img src=x onerror=alert(2)>');
+    // No input tag may survive as an ELEMENT. The escaped text form is the
+    // correct, safe outcome, so assert on live markup rather than substrings.
+    assert.ok(!/<script[\s>]/i.test(evil), 'raw <script> survived');
+    assert.ok(!/<img[\s>]/i.test(evil), 'raw <img> survived');
+    assert.ok(!/<[a-z]+[^>]*\sonerror\s*=/i.test(evil), 'live onerror attribute survived');
+    assert.ok(/&lt;script&gt;/.test(evil), 'script was not escaped');
+    // Only our own tags may appear as markup.
+    const tags = (evil.match(/<\/?[a-zA-Z][^>]*>/g) || []).map(x => x.toLowerCase());
+    tags.forEach(x => assert.ok(
+        ['<h1>', '</h1>', '<p>', '</p>'].includes(x),
+        'unexpected live tag: ' + x));
+});
+t('escapes attribute-breaking quotes in text', () =>
+    assert.ok(/&quot;|&#39;/.test(FE.escapeHtml('a"b\'c')), 'quotes not escaped'));
+t('empty input yields empty output', () => assert.strictEqual(FE.renderMarkdown(''), ''));
+
+section('CSS custom properties resolve');
+// I have now twice written var(--font-body), which does not exist in this
+// stylesheet (the token is --font-sans). Both times it failed silently: the
+// declaration is dropped and the element inherits the browser default font.
+// Nothing in a build step or a visual diff catches it on a phone. So: every
+// var(--x) reference must have a matching definition.
+const cssText = fs.readFileSync(path.join(ROOT, 'style.css'), 'utf8');
+const defined = new Set((cssText.match(/--[a-zA-Z][\w-]*(?=\s*:)/g) || []));
+const referenced = new Set((cssText.match(/var\((--[a-zA-Z][\w-]*)/g) || []).map(x => x.slice(4)));
+t('every var(--x) used in style.css is defined somewhere', () => {
+    const missing = [...referenced].filter(v => !defined.has(v));
+    assert.strictEqual(missing.length, 0, 'undefined custom properties: ' + missing.join(', '));
+});
+t('the sanity check itself works (font-body is NOT a token, font-sans is)', () => {
+    assert.ok(defined.has('--font-sans'), '--font-sans should be defined');
+    assert.ok(!defined.has('--font-body'), '--font-body must not be reintroduced');
+});
+
+section('prompt <-> extractor agreement (cross-file invariant)');
+// The system prompt tells the model to emit a BUILD PROMPT block; the frontend
+// regex looks for it. These live in different files, so they drift: the format
+// template once said "start with # UI Specification" while the instruction
+// below it said "write BUILD PROMPT first", and the model would have obeyed the
+// template, leaving the extractor finding nothing and the card permanently
+// hidden. Assert the two ends of the contract still line up.
+const BP = slice(appSrc, 'function extractBuildPrompt', 'function renderMarkdown(src) {', 'extractBuildPrompt');
+const promptsSrc = fs.readFileSync(path.join(ROOT, 'lib', 'prompts.js'), 'utf8');
+const sysPrompt = promptsSrc.slice(promptsSrc.indexOf('const SYSTEM_PROMPT'), promptsSrc.indexOf('const USER_PROMPT'));
+t('the FORMAT TEMPLATE (not just the prose) puts BUILD PROMPT first', () => {
+    const after = sysPrompt.slice(sysPrompt.indexOf('FORMAT YOUR RESPONSE EXACTLY LIKE THIS:'));
+    const firstLine = after.split('\n').map(l => l.trim()).filter(Boolean)[1]; // [0] is the marker itself
+    assert.strictEqual(firstLine, 'BUILD PROMPT',
+        'template must open with BUILD PROMPT, got: ' + JSON.stringify(firstLine));
+});
+t('a spec shaped exactly like the template is parsed by the frontend', () => {
+    const shaped = 'BUILD PROMPT\nBuild a dark-only Tailwind docs site: gray-950 bg, sky-400 accents, Inter + IBM Plex Mono, 4px spacing scale.\n\n# UI Specification: tailwindcss.com\n\n## 1. Design Tokens\n| a | b |';
+    const got = BP.extractBuildPrompt(shaped);
+    assert.ok(/gray-950/.test(got) && /sky-400/.test(got), 'build prompt not extracted: ' + JSON.stringify(got));
+    assert.ok(!got.includes('UI Specification'), 'extraction ran past the spec heading');
+});
+t('extractor returns empty (not garbage) when the model omits the block', () =>
+    assert.strictEqual(BP.extractBuildPrompt('# UI Specification: x\n## 1. Design Tokens'), ''));
+
+section('bare-host input (the "linear.app" affordance)');
+const BE = NET;
+const FEURL = slice(appSrc, 'const URL_PATTERN', 'function extractDomain', 'normalizeURL,validateURL');
+t('frontend adds https to a bare host', () => {
+    assert.strictEqual(FEURL.normalizeURL('linear.app'), 'https://linear.app');
+    assert.strictEqual(FEURL.normalizeURL('  vercel.com/docs  '), 'https://vercel.com/docs');
+    assert.strictEqual(FEURL.normalizeURL('www.foo.com'), 'https://www.foo.com');
+});
+t('frontend leaves a full URL alone', () =>
+    assert.strictEqual(FEURL.normalizeURL('https://ok.com/x'), 'https://ok.com/x'));
+t('frontend still rejects junk (does not prepend https to nonsense)', () => {
+    ['', 'not a url', 'hello world'].forEach(v =>
+        assert.ok(!FEURL.validateURL(FEURL.normalizeURL(v)), 'accepted: ' + JSON.stringify(v)));
+});
+t('backend accepts a bare host too, so curl matches the UI', () =>
+    assert.strictEqual(BE.sanitizeUrl('linear.app'), 'https://linear.app/'));
+// The affordance must not become a bypass: normalising happens BEFORE the
+// private-host check, so internal targets still resolve to null.
+t('normalisation cannot be used to reach internal hosts', () => {
+    ['127.0.0.1', 'localhost', '169.254.169.254', '10.0.0.5', 'metadata.google.internal',
+     'file:///etc/passwd', '0.0.0.0'].forEach(u =>
+        assert.strictEqual(BE.sanitizeUrl(u), null, 'reached: ' + u));
+});
+
+section('dark-mode accent: text uses must not pick up the brand --accent');
+// Live bug found on production: --accent is #f5f5f5 in dark mode, and was used
+// as a text color on links, badges, bullets, footer, and error messages, so
+// every one of those became near-white on near-white and disappeared. Fix:
+// route text-color uses of --accent through --link-text / --badge-text /
+// --bullet-text, leave --accent for backgrounds, borders, and fills.
+const css = fs.readFileSync(path.join(ROOT, 'style.css'), 'utf8');
+// --accent is #f5f5f5 in dark mode. Anywhere the CSS *color* property (not
+// border-color / background-color / accent-color, which are fine) resolves to
+// --accent, that text is invisible in dark mode. So the rule is global: no
+// `color: var(--accent)` anywhere. The leading boundary excludes the
+// hyphenated properties, which would otherwise match as substrings.
+const textAccent = css.match(/(?:^|[{;\s])color\s*:\s*var\(--accent\)/gim) || [];
+t('no `color: var(--accent)` anywhere (near-white in dark mode)', () =>
+    assert.strictEqual(textAccent.length, 0,
+        textAccent.length + ' text-color use(s) of --accent remain'));
+// The dedicated text tokens must exist in BOTH themes, or the fix is a
+// light-mode-only illusion.
+t('link/badge/bullet/code text tokens defined in light and dark', () => {
+    ['--link-text', '--badge-text', '--bullet-text', '--code-text'].forEach(tok => {
+        const light = css.slice(css.indexOf(':root'), css.indexOf('[data-theme="dark"]'));
+        const dark = css.slice(css.indexOf('[data-theme="dark"]'));
+        assert.ok(light.includes(tok + ':'), tok + ' missing from light theme');
+        assert.ok(dark.includes(tok + ':'), tok + ' missing from dark theme');
+    });
+});
+// Non-text roles must keep using the brand swatch, or we have "fixed" the
+// bug by deleting the brand.
+const brandRoles = (css.match(/\b(?:background|background-color|border-color|outline|fill|accent-color)[^;]*var\(--accent\)/gi) || []).length;
+t('--accent still drives backgrounds, borders and fills', () =>
+    assert.ok(brandRoles >= 8, 'expected >=8 non-text uses of --accent, got ' + brandRoles));
+
+section('prompt consistency');
+t('SYSTEM_PROMPT no longer asks for "not detectable"', () => {
+    const sys = promptsSrc.slice(promptsSrc.indexOf('const SYSTEM_PROMPT'), promptsSrc.indexOf('const USER_PROMPT'));
+    assert.ok(!/write 'not detectable'/.test(sys), 'system prompt still requests the placeholder');
+    assert.ok(/DO NOT write "not detectable"/.test(sys), 'system prompt lacks the prohibition');
+t('system prompt defers data to appended blocks (Step 1 contract)', () => {
+    assert.ok(/VERBATIM DATA BLOCKS/.test(sys), 'system prompt no longer states the narrative/data split');
+    assert.ok(!/HARD LIMIT: 500 words/.test(sys), 'the 500-word cap is back \u2014 it is what dropped the copy');
+});
+});
+t('USER_PROMPT omits empty sections instead of printing Not detected', () => {
+    const up = promptsSrc.slice(promptsSrc.indexOf('const USER_PROMPT'), promptsSrc.indexOf('// ============================================================\n// ASSEMBLY'));
+    assert.ok(!/\|\| 'Not detected'/.test(up), 'still emits literal "Not detected"');
+});
+
+section("index.html integrity");
+// cheerio is a parser, not a validator: it silently repairs unbalanced markup,
+// so it once reported a broken page as "well-formed". This is a real stack-based
+// balance check that will actually fail on a stray </div>.
+const htmlSrc = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
+const VOID_TAGS = new Set(["br","hr","img","input","meta","link","source","path","rect","circle","line","polyline","polygon","use","area","base","col","embed","track","wbr"]);
+function unbalanced(src) {
+    const re = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)\b[^>]*?(\/?)>/g;
+    const stack = []; let m; const errs = [];
+    while ((m = re.exec(src))) {
+        const closing = m[1] === "/", name = m[2].toLowerCase(), selfClose = m[3] === "/";
+        if (VOID_TAGS.has(name) || selfClose) continue;
+        if (!closing) stack.push(name);
+        else { const top = stack.pop();
+            if (!top) errs.push("extra </" + name + ">");
+            else if (top !== name) errs.push("<" + top + "> closed by </" + name + ">"); }
+    }
+    stack.forEach(t => errs.push("never closed <" + t + ">"));
+    return errs;
+}
+t("index.html tags balance (no stray/missing close)", () => {
+    const errs = unbalanced(htmlSrc);
+    assert.deepStrictEqual(errs, [], errs.slice(0, 4).join(" | "));
+});
+t("idle prompt box is empty — no hardcoded spec visible before JS runs", () => {
+    assert.ok(!/Replicate the UI of linear\.app with/.test(htmlSrc), "fake hand-written sample is still on the page");
+    assert.ok(/id="resultLabel">Real output/.test(htmlSrc), "idle label is present");
+    // promptContent is empty on idle load so nothing flashes before JS runs
+    assert.ok(/<div class="prompt-box" id="promptContent"[^>]*>\s*<\/div>/.test(htmlSrc), "prompt box is empty on idle");
+});
+t("no cherry-picked signal count claim", () => {
+    assert.ok(!/~120<\/span> design signals/.test(htmlSrc), "still claims ~120 design signals (that was the best case only)");
+    assert.ok(/design values per site/.test(htmlSrc), "missing the honest range label");
+});
+t("hideResult restores the honest idle label", () => {
+    const hide = appSrc.slice(appSrc.indexOf("function hideResult"), appSrc.indexOf("function hideResult") + 400);
+    assert.ok(!/= .Sample output./.test(hide), "hideResult overwrites the label with Sample output, undoing the honest caption");
+    assert.ok(/IDLE_LABEL/.test(hide), "hideResult does not restore IDLE_LABEL");
+    assert.ok(/const IDLE_LABEL/.test(appSrc), "IDLE_LABEL is not defined");
+});
+
+
+// ---- page outline: the fix for "the model never saw the page" ----------------
+const { extractPageOutline } = require(path.join(ROOT, 'lib/extract.js'));
+
+t('outline carries the visible content a head-slice never could', () => {
+    // Deliberately head-heavy: 3000 chars of meta/preload before <body>, so a
+    // naive substring(0,2500) would return nothing but head markup.
+    const filler = '<meta name="x" content="' + 'a'.repeat(60) + '">' +
+                   '<link rel="preload" href="/_next/static/media/f' + 'b'.repeat(60) + '.png" as="image">';
+    const html = '<html><head><title>Acme — Ship faster</title>' + filler.repeat(20) +
+        '</head><body><header><nav><a href="/pricing">Pricing</a><a href="/docs">Docs</a></nav></header>' +
+        '<h1>Ship faster with Acme</h1><h2>Trusted by teams</h2><h3>Realtime sync</h3>' +
+        '<button>Start free trial</button>' +
+        '<main><p>Acme turns your spreadsheet into an API in under five minutes, no code.</p></main>' +
+        '<footer><a href="/about">About</a><a href="/careers">Careers</a></footer></body></html>';
+    const out = extractPageOutline(cheerio.load(html));
+
+    assert.ok(/Ship faster with Acme/.test(out), 'missing H1 — the exact bug: model never saw page text');
+    assert.ok(/Pricing/.test(out) && /Docs/.test(out), 'missing nav labels');
+    assert.ok(/Start free trial/.test(out), 'missing button text');
+    assert.ok(/spreadsheet into an API/.test(out), 'missing body copy');
+    assert.ok(/About/.test(out) && /Careers/.test(out), 'missing footer links');
+    assert.ok(/Title \/ description/.test(out), 'missing title line');
+});
+
+t('outline stays inside its token budget', () => {
+    // A page with absurd repetition must not blow the prompt budget.
+    let body = '';
+    for (let i = 0; i < 400; i++) body += '<h2>Heading number ' + i + ' with a long tail of words to inflate it</h2>';
+    const html = '<html><head><title>T</title></head><body>' + body + '</body></html>';
+    const out = extractPageOutline(cheerio.load(html));
+    assert.ok(out.length <= 2800, 'outline grew to ' + out.length + ' chars, budget is ~2600');
+});
+
+t('outline degrades quietly on a contentless page', () => {
+    const out = extractPageOutline(cheerio.load('<html><head></head><body></body></html>'));
+    assert.strictEqual(typeof out, 'string');
+    assert.ok(out.length < 40, 'invented content for an empty page: ' + JSON.stringify(out.slice(0, 80)));
+});
+
+t('pipeline slices from <body>, not from char 0', () => {
+    // Regression guard for the root cause: substring(0,2500) on a real page is
+    // pure <head> markup, which is why specs described a theme instead of a page.
+    const src = fs.readFileSync(path.join(ROOT, 'lib/pipeline.js'), 'utf8');
+    assert.ok(/search\(\/<body/i.test(src), 'no body-first slice — reverted to head-prefix bug');
+    assert.ok(!/stripStyles\(html\)\.substring\(0,\s*2500\)/.test(src), 'still slicing the document from char 0');
+});
+
+// "outline is actually sent to the model" and the assembly tests now live in
+// the async region above the summary (they exercise assembleSpec with real
+// model-shaped narratives).
+
+section('spec fidelity: the three bugs a reviewer caught in a built page');
+// All three shipped inside blocks labelled "verbatim, use exact values", which
+// means the builder had no reason to distrust them. Each test below asserts on
+// PRODUCED OUTPUT and was mutation-checked: neutralising the corresponding fix
+// in lib/ must turn this suite red. A green suite that cannot go red is not a
+// test (four prior instances in this repo).
+t('mineMotion keeps the parenthesised reduced-motion condition', () => {
+    const css = '@media (prefers-reduced-motion:reduce){.hero{animation:none}*{transition-duration:.01ms!important}}';
+    const lines = API.mineMotion(css).filter(l => /prefers-reduced-motion/.test(l));
+    assert.ok(lines.length >= 1, 'reduced-motion contract dropped entirely');
+    for (const l of lines) {
+        assert.ok(/@media\s*\(\s*prefers-reduced-motion\s*:/i.test(l),
+            'media condition lost its parens: ' + l);
+    }
+});
+t('a global animation kill is never emitted outside an @media', () => {
+    // Without the wrapper, `*{animation:none!important}` stops being an
+    // accessibility rule and becomes a site-wide animation kill for every
+    // visitor. This is exactly what the reviewer saw in the built page.
+    const css = '@media (prefers-reduced-motion:reduce){*{animation:none!important}}' +
+        '@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}';
+    const out = API.mineMotion(css);
+    assert.ok(out.length > 0, 'mineMotion produced nothing for a motion-bearing page');
+    let nukes = 0;
+    for (const l of out) {
+        if (!/\*\s*\{[^}]*animation:\s*none/i.test(l)) continue;
+        nukes++;
+        assert.ok(/@media\s*\(/.test(l), 'site-wide kill escaped its media query: ' + l);
+    }
+    assert.strictEqual(nukes, 1, 'expected the universal kill to be present, got ' + nukes);
+});
+t('oversized copy is cut on a word boundary and MARKED, never mid-word', () => {
+    const para = Array.from({ length: 200 }, (_, i) => 'token' + i).join(' ');
+    const html = '<html><head><title>T</title></head><body><section><p>' + para + '</p></section></body></html>';
+    const out = EXTRACT.extractPageOutline(cheerio.load(html));
+    const m = out.match(/Body copy: ([^\n]*)/);
+    assert.ok(m, 'body copy vanished: ' + out.slice(0, 120));
+    const line = m[1].trim();
+    assert.ok(/token\d+ \[\u2026\]$/.test(line),
+        'copy cut mid-word or unmarked, ends: ' + JSON.stringify(line.slice(-30)));
+});
+t('a group that cannot fit says so instead of silently vanishing', () => {
+    // The old rule dropped the WHOLE group when it did not fit, so a spec could
+    // contain zero body copy and look complete. A builder that cannot see the
+    // hole invents one: prices, feature lists, footer links.
+    let body = '';
+    for (let i = 0; i < 300; i++) body += '<h2>Heading ' + i + ' ' + 'tail '.repeat(22) + '</h2>';
+    for (let i = 0; i < 40; i++) body += '<section><p>' + Array.from({ length: 70 }, (_, j) => 'para' + i + 'word' + j).join(' ') + '</p></section>';
+    const out = EXTRACT.extractPageOutline(cheerio.load('<html><head><title>T</title></head><body>' + body + '</html>'));
+    assert.ok(out.length <= 6600, 'outline blew the budget: ' + out.length);
+    assert.ok(/\[\d+ more\]|NOT CAPTURED \(budget\)/.test(out),
+        'content was dropped with no signal to the builder');
+});
+
+
+(async () => {
+
+// ============================================================
+// Custom BYOK endpoint. lib/ai.js and lib/cache.js previously had ZERO
+// coverage, which is how a model-ID regex excluding '/' shipped: it silently
+// rejected every OpenRouter/Together model, and a null normalisation falls back
+// to the free tier, so the user saw a working result from the wrong engine.
+// ============================================================
+async function ta(name, fn) {
+    try { await fn(); pass++; console.log('  ok   ' + name); }
+    catch (e) { fail++; console.log('  FAIL ' + name + '\n         ' + String(e && e.message || e).split('\n')[0]); }
+}
+
+section('custom BYOK endpoint - URL resolution');
+t('base URL gets /chat/completions appended', () => {
+    const r = AI.resolveCustomTarget('https://openrouter.ai/api/v1');
+    assert.strictEqual(r.endpoint, 'https://openrouter.ai/api/v1/chat/completions');
+    assert.strictEqual(r.style, 'openai');
+});
+t('a full endpoint is NOT double-appended (most likely user error)', () => {
+    const r = AI.resolveCustomTarget('https://api.groq.com/openai/v1/chat/completions');
+    assert.strictEqual(r.endpoint, 'https://api.groq.com/openai/v1/chat/completions');
+});
+t('anthropic-shaped host uses /v1/messages', () => {
+    const r = AI.resolveCustomTarget('https://api.anthropic.com/v1');
+    assert.strictEqual(r.style, 'anthropic');
+    assert.ok(/\/v1\/messages$/.test(r.endpoint), r.endpoint);
+});
+t('http is refused: the request carries a secret key', () => {
+    assert.strictEqual(AI.resolveCustomTarget('http://openrouter.ai/api/v1'), null);
+});
+t('loopback / link-local metadata refused', () => {
+    assert.strictEqual(AI.resolveCustomTarget('https://127.0.0.1:8080/v1'), null);
+    assert.strictEqual(AI.resolveCustomTarget('https://169.254.169.254/latest/meta-data'), null);
+});
+t('embedded credentials refused', () => {
+    assert.strictEqual(AI.resolveCustomTarget('https://user:pass@evil.example/v1'), null);
+});
+
+section('custom BYOK endpoint - normalisation');
+const CKEY = 'sk-or-v1-' + 'a'.repeat(40);
+t('REGRESSION: model IDs containing / are accepted (OpenRouter/Together)', () => {
+    for (const m of ['openai/gpt-4o-mini', 'meta-llama/llama-3.3-70b-instruct', 'deepseek-ai/DeepSeek-V3']) {
+        const r = AI.normalizeByok({ provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', model: m, key: CKEY });
+        assert.ok(r, 'rejected ' + m);
+        assert.strictEqual(r.model, m);
+    }
+});
+t('custom without a base URL is rejected, not silently downgraded', () => {
+    assert.strictEqual(AI.normalizeByok({ provider: 'custom', model: 'x/y', key: CKEY }), null);
+});
+t('model charset blocks URL/transport metacharacters', () => {
+    // The model goes only into the JSON body, never into a URL, so '.' and '/'
+    // are allowed by design (they are required for org/name model IDs).
+    // What must stay blocked are characters that could break out of the string
+    // context or smuggle a second request.
+    for (const m of ['a/b?x=1', 'a#frag', 'a b', 'a\rb', 'a\nb', 'a[', 'a%00', 'a@b', 'a&b', '']) {
+        assert.strictEqual(AI.normalizeByok({ provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', model: m, key: CKEY }), null, 'allowed ' + JSON.stringify(m));
+    }
+});
+t('model longer than 80 chars is rejected (body-size guard)', () => {
+    assert.strictEqual(AI.normalizeByok({ provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', model: 'a'.repeat(81), key: CKEY }), null);
+});
+t('unknown provider still rejected (allowlist intact)', () => {
+    assert.strictEqual(AI.normalizeByok({ provider: 'evil', baseUrl: 'https://openrouter.ai/api/v1', model: 'a', key: CKEY }), null);
+});
+
+section('custom BYOK endpoint - cache isolation');
+t('different custom hosts with the same model do NOT collide', () => {
+    const mk = (host) => AI.normalizeByok({ provider: 'custom', baseUrl: 'https://' + host + '/v1', model: 'llama-3', key: CKEY });
+    const a = CACHE.cacheKey('https://x.com', mk('openrouter.ai'));
+    const b = CACHE.cacheKey('https://x.com', mk('groq.com'));
+    assert.notStrictEqual(a, b, 'cache collision: ' + a);
+});
+t('the cache key never contains the API key', () => {
+    const k = CACHE.cacheKey('https://x.com', AI.normalizeByok({ provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', model: 'a/b', key: CKEY }));
+    assert.ok(!k.includes(CKEY), 'key leaked into cache key');
+    assert.ok(!k.includes('sk-or'), 'key fragment in cache key');
+});
+
+section('custom BYOK endpoint - request policy (fetch capture)');
+async function capture(byok) {
+    const real = globalThis.fetch;
+    let cap = null;
+    globalThis.fetch = async (u, o) => {
+        cap = { u: String(u), o };
+        return { status: 200, ok: true, headers: { get: () => null }, json: async () => ({}), text: async () => '' };
+    };
+    try { await AI.callAI([{ role: 'user', content: 'hi' }], byok, { timeoutMs: 2000 }); }
+    catch (_) { /* response shape is irrelevant: we assert on the REQUEST */ }
+    finally { globalThis.fetch = real; }
+    assert.ok(cap, 'fetch was never called');
+    return cap;
+}
+await ta('custom endpoints are fetched with redirect:manual', async () => {
+    const cap = await capture(AI.normalizeByok({ provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', model: 'a/b', key: CKEY }));
+    assert.strictEqual(cap.o.redirect, 'manual', 'redirect=' + cap.o.redirect);
+});
+await ta('built-in providers keep redirect:follow (no regression)', async () => {
+    const cap = await capture(AI.normalizeByok({ provider: 'openai', model: 'gpt-4o-mini', key: CKEY }));
+    assert.strictEqual(cap.o.redirect, 'follow');
+});
+await ta('the key travels in a header, never in the URL', async () => {
+    const cap = await capture(AI.normalizeByok({ provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', model: 'a/b', key: CKEY }));
+    assert.ok(!cap.u.includes(CKEY), 'key in URL: ' + cap.u);
+    assert.strictEqual(cap.o.headers.Authorization, 'Bearer ' + CKEY);
+});
+await ta('a 307 from a custom endpoint is refused, not followed', async () => {
+    const real = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; return { status: 307, ok: false, headers: { get: () => null }, text: async () => '' }; };
+    let err = null;
+    try { await AI.callAI([{ role: 'user', content: 'hi' }], AI.normalizeByok({ provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', model: 'a/b', key: CKEY }), { timeoutMs: 2000 }); }
+    catch (e) { err = e; }
+    finally { globalThis.fetch = real; }
+    assert.strictEqual(calls, 1, 'followed the redirect (' + calls + ' calls)');
+    assert.ok(err && /redirect/i.test(err.message), 'wrong error: ' + (err && err.message));
+});
+
+// ---------------------------------------------------------------- css.js
+// The silent-degradation bug class: fetchCssFiles() used to return '' on failure,
+// making "we could not read the CSS" indistinguishable from "this site has no
+// CSS". Both produced a confident, well-formatted spec full of zeros.
+
+await ta('a site with no stylesheets is NOT degraded (example.com case)', async () => {
+    const $ = cheerio.load('<html><head></head><body><h1>hi</h1></body></html>');
+    const r = await CSS.fetchCssFiles($, 'https://example.com/');
+    assert.strictEqual(r.degraded, false, 'legitimately-empty must not read as failure');
+    assert.strictEqual(r.status.linked, 0);
+    assert.strictEqual(r.css, '');
+});
+
+await ta('stylesheets present but ALL unreachable IS degraded', async () => {
+    const real = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('HTTP 403'); };
+    try {
+        const $ = cheerio.load('<html><head><link rel="stylesheet" href="/a.css"><link rel="stylesheet" href="/b.css"></head><body></body></html>');
+        const r = await CSS.fetchCssFiles($, 'https://site.test/');
+        assert.strictEqual(r.degraded, true, 'all-failed must be flagged');
+        assert.strictEqual(r.status.linked, 2);
+        assert.strictEqual(r.status.failed, 2, 'failed count wrong: ' + JSON.stringify(r.status));
+        assert.strictEqual(r.status.ok, 0);
+    } finally { globalThis.fetch = real; }
+});
+
+await ta('one stylesheet succeeding is enough to not be degraded', async () => {
+    const real = globalThis.fetch;
+    globalThis.fetch = async (u) => ({
+        ok: true, status: 200,
+        text: async () => String(u).endsWith('a.css') ? '--brand: #123456;' : ''
+    });
+    try {
+        const $ = cheerio.load('<html><head><link rel="stylesheet" href="/a.css"><link rel="stylesheet" href="/b.css"></head><body></body></html>');
+        const r = await CSS.fetchCssFiles($, 'https://site.test/');
+        assert.strictEqual(r.degraded, false);
+        assert.ok(r.css.includes('--brand'), 'css lost despite a good response');
+    } finally { globalThis.fetch = real; }
+});
+
+await ta('tally stays complete when CSS_MAX_BYTES truncates', async () => {
+    // Regression: the original loop `break`ed on truncation, so
+    // ok+timedOut+failed silently disagreed with `linked`. A wrong denominator
+    // is how a health signal starts lying.
+    const real = globalThis.fetch;
+    const big = 'x'.repeat(CSS.CSS_MAX_BYTES + 10);
+    globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => big });
+    try {
+        const $ = cheerio.load('<html><head>' +
+            '<link rel="stylesheet" href="/1.css"><link rel="stylesheet" href="/2.css">' +
+            '<link rel="stylesheet" href="/3.css"><link rel="stylesheet" href="/4.css">' +
+            '</head><body></body></html>');
+        const r = await CSS.fetchCssFiles($, 'https://site.test/');
+        assert.strictEqual(r.status.truncated, true, 'should have truncated');
+        const sum = r.status.ok + r.status.timedOut + r.status.failed;
+        assert.strictEqual(sum, r.status.linked,
+            `tally disagrees: ${sum} != ${r.status.linked} (${JSON.stringify(r.status)})`);
+        assert.strictEqual(r.degraded, false, 'truncation is not degradation');
+    } finally { globalThis.fetch = real; }
+});
+
+await ta('cssFetchBudget shrinks as the request deadline approaches', async () => {
+    // The raised CSS caps are only safe if a slow page fetch cannot leave the
+    // model no time. This is the pure half of that guarantee.
+    assert.strictEqual(CSS.cssFetchBudget(0), CSS.CSS_FETCH_MS, 'no deadline must not change behaviour');
+    assert.strictEqual(CSS.cssFetchBudget(undefined), CSS.CSS_FETCH_MS, 'absent deadline must not change behaviour');
+    // Plenty of time left -> capped at the normal per-file ceiling, not more.
+    assert.strictEqual(CSS.cssFetchBudget(Date.now() + 60000), CSS.CSS_FETCH_MS);
+    // Deadline already blown -> must clamp to the floor, never zero or negative
+    // (AbortSignal.timeout(0) aborts instantly and would read as a broken site).
+    const blown = CSS.cssFetchBudget(Date.now() - 60000);
+    assert.strictEqual(blown, CSS.CSS_FETCH_MIN_MS, 'past deadline should clamp to floor, got ' + blown);
+    // Mid-range: 20s left with a 15s reserve -> 5s, and it must sit between bounds.
+    const mid = CSS.cssFetchBudget(Date.now() + 20000);
+    assert.ok(mid > CSS.CSS_FETCH_MIN_MS && mid < CSS.CSS_FETCH_MS, 'mid-range budget: ' + mid);
+});
+
+await ta('fetchCssFiles applies the deadline budget to the real fetch', async () => {
+    // Mutation-proof by construction: the stub NEVER resolves, so the only thing
+    // that can end the wait is the per-file timeout. Elapsed time therefore
+    // measures the budget actually APPLIED -- not a status field reporting
+    // intent. (An earlier version asserted status.fetchMs and survived deleting
+    // the wiring; before that, relying on AbortSignal.timeout alone made the
+    // event loop drain and Node exited 0 mid-suite, silently truncating it.)
+    const real = globalThis.fetch;
+    globalThis.fetch = (u, o) => new Promise((_, rej) => {
+        const sig = o && o.signal;
+        if (!sig) return rej(new Error('no signal forwarded — budget not wired'));
+        const keepAlive = setTimeout(() => rej(new Error('stub outlived the budget')), CSS.CSS_FETCH_MS + 4000);
+        const abort = () => { clearTimeout(keepAlive); const e = new Error('aborted'); e.name = 'TimeoutError'; rej(e); };
+        if (sig.aborted) return abort();
+        sig.addEventListener('abort', abort, { once: true });
+    });
+    try {
+        const $ = cheerio.load('<html><head><link rel="stylesheet" href="/a.css"></head><body></body></html>');
+        const t0 = Date.now();
+        const blown = await CSS.fetchCssFiles($, 'https://site.test/', { deadlineAt: Date.now() - 60000 });
+        const elapsed = Date.now() - t0;
+        assert.ok(elapsed < 5000,
+            'blown deadline still waited ' + elapsed + 'ms — budget NOT applied (floor ' +
+            CSS.CSS_FETCH_MIN_MS + 'ms vs constant ' + CSS.CSS_FETCH_MS + 'ms)');
+        assert.ok(blown.status.timedOut >= 1, 'stall must classify as timeout: ' + JSON.stringify(blown.status));
+        assert.strictEqual(blown.degraded, true, 'no CSS retrieved, so it must report degraded');
+    } finally { globalThis.fetch = real; }
+});
+
+await ta('pipeline throws CssUnavailableError rather than emitting zeros', async () => {
+    const real = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('socket hang up'); };
+    try {
+        const html = '<html><head><link rel="stylesheet" href="/a.css"></head><body><h1>hi</h1></body></html>';
+        let err = null;
+        try { await PIPELINE.buildAnalysisPrompt(html, cheerio.load(html), 'https://site.test/', 'site.test'); }
+        catch (e) { err = e; }
+        assert.ok(err instanceof CSS.CssUnavailableError, 'expected CssUnavailableError, got: ' + (err && err.name));
+        assert.ok(err.status && err.status.linked === 1, 'status not carried');
+    } finally { globalThis.fetch = real; }
+});
+
+await ta('diagnostics never reach the AI prompt', async () => {
+    // USER_PROMPT reads extracted fields by NAME (no Object.keys iteration), so a
+    // new top-level field cannot leak. This asserts that property holds, because
+    // if someone refactors USER_PROMPT to iterate keys, our internals go to the model.
+    const src = fs.readFileSync(path.join(ROOT, 'lib', 'prompts.js'), 'utf8');
+    assert.ok(!/Object\.keys\(\s*(e|data\.extracted)\s*\)/.test(src),
+        'USER_PROMPT now iterates extracted keys — cssStatus could leak into the prompt');
+});
+
+
+
+// ------------------------------------------------------ inline <style> mining
+// THE BUG: a site can ship its whole design system in inline <style> tags and
+// link zero stylesheets. extractCssHrefs() alone saw none, and the early return
+// reported degraded:false — so we served a confident spec containing no colours
+// and called it "this site has no design tokens". Measured on framer.com:
+// 0 linked, 7 <style> tags, 492KB CSS, 1,263 custom properties -> OLD HEX=0,
+// NEW HEX=23. These tests exist because the 217-test suite passed WITHOUT
+// touching extractInlineCss at all: coverage that cannot fail is not coverage.
+
+await ta('inline-only site yields tokens and is NOT degraded (framer case)', async () => {
+    const $ = cheerio.load(
+        '<html><head><style>:root{--brand:#1E3CC8;--bg:#0b0d12;--radius:8px}</style>' +
+        '<style>body{--text-lg:24px;--pad:16px}</style></head><body></body></html>');
+    const r = await CSS.fetchCssFiles($, 'https://framer.test/');
+    assert.strictEqual(r.status.linked, 0, 'premise: no linked stylesheets');
+    assert.strictEqual(r.degraded, false, 'inline CSS means we learned something');
+    assert.ok(r.css.includes('--brand:#1E3CC8'), 'inline tokens dropped: ' + r.css);
+    assert.ok(r.css.includes('--text-lg'), 'second <style> tag dropped');
+    assert.ok(r.status.inline > 0, 'status.inline must report inline byte count');
+});
+
+await ta('non-CSS style types are ignored', async () => {
+    const $ = cheerio.load(
+        '<html><head><script type="application/json">{"--fake":"#000000"}</script>' +
+        '<style type="text/plain">--nope:#111111</style>' +
+        '<style type="text/css">--yes:#222222</style></head><body></body></html>');
+    const r = await CSS.fetchCssFiles($, 'https://type.test/');
+    assert.ok(r.css.includes('--yes'), 'text/css style must be kept');
+    assert.ok(!r.css.includes('--nope'), 'text/plain must be skipped');
+    assert.ok(!r.css.includes('--fake'), 'JSON in a script tag is not CSS');
+});
+
+await ta('linked CSS keeps precedence over inline (append order)', async () => {
+    const real = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, status: 200,
+        text: async () => ':root{--brand:#AAAAAA}' });
+    try {
+        const $ = cheerio.load(
+            '<html><head><link rel="stylesheet" href="/a.css">' +
+            '<style>:root{--brand:#BBBBBB}</style></head><body></body></html>');
+        const r = await CSS.fetchCssFiles($, 'https://prec.test/');
+        const li = r.css.indexOf('#AAAAAA'), ii = r.css.indexOf('#BBBBBB');
+        assert.ok(li >= 0 && ii > li, 'linked must come first: ' + r.css);
+        assert.strictEqual(r.status.ok, 1);
+    } finally { globalThis.fetch = real; }
+});
+
+await ta('failed links + token-free inline still reports degraded', async () => {
+    // The regression this whole fix could have re-introduced: if "we fetched no
+    // links" were enough to clear degraded, a site whose links 403 and whose
+    // inline CSS is only body{color:red} would silently yield a zero spec.
+    const real = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('HTTP 403'); };
+    try {
+        const $ = cheerio.load(
+            '<html><head><link rel="stylesheet" href="/a.css">' +
+            '<style>body{color:red}</style></head><body></body></html>');
+        const r = await CSS.fetchCssFiles($, 'https://part.test/');
+        assert.strictEqual(r.degraded, true, 'presence of bytes is not the test');
+        assert.strictEqual(r.status.inlineYields, false, 'no custom properties in inline');
+    } finally { globalThis.fetch = real; }
+});
+
+await ta('inline CSS respects the combined byte ceiling', async () => {
+    const big = '--x' + 'z'.repeat(80) + ': #' + 'A'.repeat(6) + ';';
+    const blob = new Array(60000).fill(big).join('');
+    const $ = cheerio.load('<html><head><style>' + blob + '</style></head><body></body></html>');
+    const r = await CSS.fetchCssFiles($, 'https://cap.test/');
+    assert.ok(r.css.length <= CSS.CSS_MAX_BYTES,
+        'inline bypassed the cap: ' + r.css.length + ' > ' + CSS.CSS_MAX_BYTES);
+});
+
+// ------------------------------------------------- degraded CSS must not be cached
+// The entire reason the throw exists: CACHE_TTL_MS is 6 hours, so a stored
+// degraded result is not one bad page view — it is every visitor of that URL
+// for half a day, served with cached:true and no hint anything failed.
+// cache.js documents "a failure is never stored"; these tests make that true
+// for this specific failure rather than by analogy with the AI errors.
+
+await ta('a degraded CSS run leaves the cache empty', async () => {
+    CACHE.clear();
+    const key = 'free|https://degraded.test';
+    let attempts = 0;
+    const failing = async () => { attempts++; throw new CSS.CssUnavailableError({ linked: 3, ok: 0 }); };
+
+    let err = null;
+    try { await CACHE.remember(key, failing); } catch (e) { err = e; }
+    assert.ok(err instanceof CSS.CssUnavailableError, 'producer error not propagated: ' + (err && err.name));
+    assert.strictEqual(attempts, 1);
+    assert.strictEqual(CACHE.get(key), null, 'DEGRADED RESULT WAS CACHED');
+    assert.strictEqual(CACHE.stats().entries, 0, 'cache not empty: ' + CACHE.stats().entries);
+});
+
+await ta('the next request re-runs rather than serving a poisoned entry', async () => {
+    CACHE.clear();
+    const key = 'free|https://recover.test';
+    let attempts = 0;
+    const flaky = () => { attempts++; return Promise.reject(new CSS.CssUnavailableError({ linked: 2 })); };
+    try { await CACHE.remember(key, flaky); } catch (e) { /* expected */ }
+    assert.strictEqual(attempts, 1);
+
+    // Same URL, now healthy: must actually run, not return a cached zero-spec.
+    const ok = () => { attempts++; return Promise.resolve({ prompt: 'real spec' }); };
+    const r = await CACHE.remember(key, ok);
+    assert.strictEqual(attempts, 2, 'healthy retry was skipped — cache was poisoned');
+    assert.strictEqual(r.source, 'miss');
+    assert.strictEqual(r.value.prompt, 'real spec');
+    CACHE.clear();
+});
+
+await ta('a concurrent duplicate shares the failure, not a fake success', async () => {
+    CACHE.clear();
+    const key = 'free|https://dup.test';
+    let attempts = 0;
+    const slowFail = () => new Promise((_, rej) => {
+        attempts++;
+        setTimeout(() => rej(new CSS.CssUnavailableError({ linked: 1 })), 30);
+    });
+    const both = await Promise.allSettled([
+        CACHE.remember(key, slowFail),
+        CACHE.remember(key, slowFail)
+    ]);
+    assert.strictEqual(attempts, 1, 'duplicate fired a second producer: ' + attempts);
+    assert.ok(both.every((b) => b.status === 'rejected'), 'a duplicate resolved successfully');
+    assert.strictEqual(CACHE.get(key), null, 'poisoned entry after shared failure');
+    CACHE.clear();
+});
+
+
+
+// --- secret-leak guard -----------------------------------------------------
+// A credential once committed to a PUBLIC repo is in git history forever; the
+// only real remedy is revocation at the provider. This test cannot fix history
+// but it fails loudly if a live-looking key is present in the working tree, so
+// the class of mistake that shipped sk-... in .env.example cannot repeat.
+await ta('no live-looking credentials in tracked files', async () => {
+    const { execFileSync } = require('child_process');
+    const path = require('path');
+    const REPO = path.join(__dirname, '..');
+    const files = execFileSync('git', ['ls-files'], { cwd: REPO, encoding: 'utf8' })
+        .trim().split('\n').filter(Boolean);
+
+    const SECRET = /\b(?:sk|ghp|github_pat|AKIA|xox[baprs])[-_][A-Za-z0-9]{16,}\b/g;
+    // Placeholders are fine here - they are documentation. Only high-entropy
+    // looking values count as a leak.
+    const PLACEHOLDER = /your|placeholder|example|changeme|replace|redacted|dummy|sample|fake|test|xxxx|0000|abcd/i;
+    const isReal = (s) => {
+        const body = s.replace(/^(?:sk|ghp|github_pat|AKIA|xox[baprs])[-_]/, '');
+        if (PLACEHOLDER.test(s)) return false;
+        if (/^(.)(\1*)$/.test(body)) return false;          // one repeated char
+        const uniq = new Set(body).size;
+        return uniq >= 8;                                     // low entropy = not a key
+    };
+
+    const hits = [];
+    for (const f of files) {
+        let text;
+        try { text = fs.readFileSync(path.join(REPO, f), 'utf8'); }
+        catch { continue; }                                   // binary/unreadable
+        for (const m of text.match(SECRET) || []) {
+            if (isReal(m)) hits.push(f + ' -> ' + m.slice(0, 7) + '…');
+        }
+    }
+    assert.deepStrictEqual(hits, [], 'tracked files contain live-looking keys:\n         ' + hits.join('\n         '));
+});
+
+section('font mining (mineFonts / mineFontFaces / decodeCssIdent)');
+// These functions had ZERO coverage while producing the font data shown on
+// every published spec page. Two live bugs slipped through unnoticed: an
+// icon-font filter whose regex was double-escaped (so it matched nothing at
+// all), and undecoded CSS escapes printed raw on apple.com's page.
+
+t('decodeCssIdent: hex escape consumes exactly one following space', () => {
+    assert.strictEqual(MINE.decodeCssIdent('\\30d2 x'), 'ヒx');
+});
+t('decodeCssIdent: 1-6 hex digits', () => {
+    assert.strictEqual(MINE.decodeCssIdent('\\0041 \\0042'), 'AB');
+    assert.strictEqual(MINE.decodeCssIdent('W\\00f6hrner'), 'Wöhrner');
+});
+t('decodeCssIdent: escaped ordinary char, including space', () => {
+    assert.strictEqual(MINE.decodeCssIdent('\\ '), ' ');
+    assert.strictEqual(MINE.decodeCssIdent('a\\-b'), 'a-b');
+});
+t('decodeCssIdent: lone trailing backslash dropped', () => {
+    assert.strictEqual(MINE.decodeCssIdent('a\\'), 'a');
+});
+t('decodeCssIdent: surrogate / out-of-range -> replacement char', () => {
+    assert.strictEqual(MINE.decodeCssIdent('\\d800'), '\ufffd');
+    assert.strictEqual(MINE.decodeCssIdent('\\110000'), '\ufffd');
+});
+t('decodeCssIdent: plain names untouched', () => {
+    assert.strictEqual(MINE.decodeCssIdent('Inter'), 'Inter');
+});
+t('mineFontFaces: decodes escapes inside @font-face', () => {
+    // Built from char codes: a backslash inside a JS string literal is
+    // eaten by string escaping, which is how this fixture failed twice.
+    const BS = String.fromCharCode(92);
+    const css = "@font-face{font-family:'" + BS + '30d2' + BS + '30e9' + BS + " Pro W3';src:url(a.woff2)}";
+    const faces = [...MINE.mineFontFaces(css)];
+    assert.deepStrictEqual(faces, ['ヒラ Pro W3']);
+});
+t('mineFonts: drops generic, fallback and CSS-wide keywords', () => {
+    const r = MINE.mineFonts("body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif,inherit}");
+    assert.deepStrictEqual(r, []);
+});
+t('mineFonts: drops icon fonts (regression for the dead double-escaped regex)', () => {
+    const r = MINE.mineFonts("body{font-family:'Apple Icons 100','Chevron Sans','Material Icons',Inter}");
+    assert.ok(!r.some(f => /icon|chevron/i.test(f)), 'kept junk: ' + r.join(','));
+    assert.ok(r.includes('Inter'), 'dropped real font: ' + r.join(','));
+});
+t('mineFonts: collapses script subsets of one family', () => {
+    const r = MINE.mineFonts("body{font-family:'Circular Sp-Arab','Circular Sp-Deva','Circular Sp-Grek','Circular Sp'}");
+    assert.strictEqual(r.length, 1, 'expected 1 family, got: ' + r.join(','));
+});
+t('mineFonts: fonts the site ships itself are listed first', () => {
+    const css = "@font-face{font-family:'Own Sans';src:url(x.woff2)}\nbody{font-family:'Zeta Custom','Own Sans'}";
+    assert.deepStrictEqual(MINE.mineFonts(css), ['Own Sans', 'Zeta Custom']);
+});
+t('mineFonts: decodes escapes in plain declarations (apple.com regression)', () => {
+    const B = String.fromCharCode(92);
+    // Real shape from apple.com: two hex escapes, then a double space (one is
+    // consumed by the escape, one is the separator), then 'Pro W3'.
+    const css = 'body{font-family:' + B + '30d2' + B + '30e9' + B + '30ae' + B + '30ce' + B + '89d2' + B + '30b4  Pro W3, SF Pro Text';
+    const r = MINE.mineFonts(css);
+    assert.ok(r.includes('ヒラギノ角ゴ Pro W3'), 'not decoded: ' + JSON.stringify(r));
+    assert.ok(!r.some(f => f.includes(B)), 'raw escape leaked: ' + JSON.stringify(r));
+});
+t('mineFonts: escaped name still matches its decoded @font-face for sorting', () => {
+    const B = String.fromCharCode(92);
+    const css = '@font-face{font-family:' + B + '30d2' + B + '30e9  Pro W3;src:url(a.woff2)}' +
+                '\nbody{font-family:Zeta Custom,' + B + '30d2' + B + '30e9  Pro W3}';
+    assert.deepStrictEqual(MINE.mineFonts(css), ['ヒラ Pro W3', 'Zeta Custom']);
+});
+
+t('mineFonts: capped at 10', () => {
+    const names = Array.from({ length: 12 }, (_, i) => "'Fam" + i + "'").join(',');
+    assert.strictEqual(MINE.mineFonts('body{font-family:' + names + '}').length, 10);
+});
+
+// ============================================================
+// Step 1 assembly contract: narrative from the model, data from the machine.
+// Awaiting these matters: the old bug class here was tests that registered
+// but never executed, so run this suite only through the async tail.
+// ============================================================
+const t2 = async (name, fn) => {
+    try { await fn(); pass++; console.log('  ok   ' + name); }
+    catch (e) { fail++; console.log('  FAIL ' + name + '\n         ' + String(e && e.message || e).split('\n')[0]); }
+};
+section('spec assembly (narrative + verbatim data blocks)');
+
+const { assembleSpec } = require(path.join(ROOT, 'lib/prompts.js'));
+const fullExtracted = () => ({
+    colors: ['#0a0a0a', '#38bdf8'],
+    fonts: ['Inter'],
+    layoutPatterns: [],
+    componentPatterns: [],
+    responsiveBreakpoints: ['768px'],
+    designTokens: ['--bg: #0a0a0a', '--accent: #38bdf8'],
+    componentRules: ['.btn { background: var(--accent); border-radius: 8px }'],
+    cssFonts: ['Inter', 'IBM Plex Mono'],
+    fontSizes: ['16px', '14px'],
+    cssBreakpoints: ['768px', '1024px'],
+    pageOutline: 'Title / description: Acme | Headings in DOM order: H1 The real headline',
+    assets: 'img[hero]: /images/hero.avif alt="Launch screen"',
+    motion: '@keyframes fade {from{opacity:0}to{opacity:1}}'
+});
+const ANALYSIS = { domain: 'acme.test', extracted: fullExtracted() };
+const NARRATIVE = 'BUILD PROMPT\nRebuild acme.test with the attached tokens and copy.\n\n# UI Specification: acme.test\n\n## 1. Design Tokens\nDeferred to data block.\n\n## 8. Build Instructions for AI Editor\n1. Scaffold with data block 10.\n';
+
+await t2('outline is actually sent to the model', async () => {
+    const data = { url: 'https://x.com', domain: 'x.com', rawHtml: '<body></body>', cssStyles: '',
+        extracted: { fonts: [], fontSizes: [], colors: [], layoutPatterns: [], componentPatterns: [],
+                     responsiveBreakpoints: [], designTokens: ['--a: #fff'], cssFonts: [], cssBreakpoints: [],
+                     componentRules: [], pageOutline: 'Headings in DOM order: H1 The real headline' } };
+    const up = PROMPTS.USER_PROMPT(data);
+    assert.ok(/The real headline/.test(up), 'pageOutline not included in the user prompt');
+    assert.ok(/what this site IS/i.test(up), 'outline is sent but not labelled as the identity source');
+});
+
+await t2('the 500-word cap is gone from BOTH prompts', async () => {
+    const up = PROMPTS.USER_PROMPT(ANALYSIS);
+    assert.ok(!/500 words/.test(up), 'USER_PROMPT still caps at 500 words');
+    assert.ok(!/500 words/.test(PROMPTS.SYSTEM_PROMPT), 'SYSTEM_PROMPT still caps at 500 words');
+    assert.ok(!/Reproduce that table ONCE/.test(up), 'USER_PROMPT still asks the model to retype the token table');
+    assert.ok(/NEVER copy a data block/.test(up), 'USER_PROMPT no longer forbids restating data');
+});
+
+await t2('a model that drops the copy still ships it (the framer.com failure shape)', async () => {
+    // The narrative below deliberately contains NONE of the site's text, no
+    // hexes, no asset URLs \u2014 the exact way the capped model failed in
+    // production. The assembled deliverable must carry all of it anyway.
+    const spec = assembleSpec(NARRATIVE, ANALYSIS);
+    assert.ok(spec.includes('H1 The real headline'), 'verbatim copy missing from assembled spec');
+    assert.ok(spec.includes('--accent: #38bdf8'), 'design tokens missing from assembled spec');
+    assert.ok(spec.includes('hero.avif'), 'asset inventory missing from assembled spec');
+    assert.ok(spec.includes('@keyframes fade'), 'motion missing from assembled spec');
+    assert.ok(spec.indexOf('## 8. Build Instructions') < spec.indexOf('## 10. Design Tokens'),
+        'data blocks must come AFTER the narrative checklist');
+    assert.ok(spec.startsWith('BUILD PROMPT'), 'build prompt must stay first for extractBuildPrompt()');
+    // Block titles carry the "verbatim" instruction; the narrative must not.
+    const blocks = spec.slice(spec.indexOf('## 10.'));
+    assert.ok(/\(extracted from acme\.test \u2014 verbatim/.test(blocks), 'blocks lost their verbatim marker');
+    assert.ok(!/verbatim/.test(spec.slice(0, spec.indexOf('## 10.'))), 'narrative echoes the verbatim marker');
+});
+
+await t2('blocks 14/15 carry the producer output (no phantom promise)', async () => {
+    const spec = assembleSpec(NARRATIVE, ANALYSIS);
+    assert.ok(/## 14\. Assets/.test(spec), 'block 14 missing while prompt promises asset URLs');
+    assert.ok(/## 15\. Motion/.test(spec), 'block 15 missing while prompt promises keyframes');
+    assert.ok(spec.includes('hero.avif') && spec.includes('@keyframes fade'), 'block present but body empty');
+    // and the producers really are wired into the pipeline
+    const pipe = require('fs').readFileSync(path.join(ROOT, 'lib/pipeline.js'), 'utf8');
+    assert.ok(/assets: mineAssets\(\$, url\)/.test(pipe), 'pipeline no longer produces assets');
+    assert.ok(/motion: mineMotion\(css\)/.test(pipe), 'pipeline no longer produces motion');
+    // example.com shape: no css, no imgs -> both blocks absent, no empty headers
+    const sparse = assembleSpec('BUILD PROMPT\nx', { domain: 'e.test', extracted: { designTokens: ['--a: #1'], assets: [], motion: [] } });
+    assert.ok(!/## 14\./.test(sparse) && !/## 15\./.test(sparse), 'empty 14/15 emitted as headings');
+});
+
+await t2('mineMotion BEHAVIOUR: emits real keyframes, not just a call site', async () => {
+    // The source-grep guard above cannot fail if mineMotion's body is gutted —
+    // verified by mutation: replacing the body with `return []` left the suite
+    // green at 118/118. These assert on produced output instead.
+    const css = '@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}' +
+                '.hero{animation:fadeUp .8s cubic-bezier(.2,.8,.2,1) both}' +
+                '.btn{transition:transform 200ms ease}' +
+                '@media (prefers-reduced-motion:reduce){.hero{animation:none}}';
+    const lines = MINE.mineMotion(css);
+    assert.ok(Array.isArray(lines) && lines.length > 0, 'mineMotion returned nothing for CSS that has motion');
+    assert.ok(lines.some(l => /@keyframes\s+fadeUp:/.test(l) && /translateY\(20px\)/.test(l)), 'keyframe body lost: ' + JSON.stringify(lines));
+    assert.ok(lines.some(l => /\.hero\s*\{.*animation:fadeUp/.test(l) && /\.8s/.test(l)), 'animation shorthand + duration lost');
+    assert.ok(lines.some(l => /\.btn\s*\{.*transition:transform 200ms/.test(l)), 'transition duration lost');
+    assert.ok(lines.some(l => /prefers-reduced-motion/.test(l) && /animation:none/.test(l)), 'reduced-motion contract lost');
+    // dedupe by name, last definition wins (the cascade's own rule)
+    assert.strictEqual(MINE.mineMotion('@keyframes a{from{opacity:0}}@keyframes a{from{opacity:.5}}')
+        .filter(l => l.includes('@keyframes a')).length, 1, 'duplicate keyframe name not collapsed');
+    assert.deepStrictEqual(MINE.mineMotion(''), [], 'empty CSS must yield []');
+    assert.deepStrictEqual(MINE.mineMotion(undefined), [], 'undefined CSS must yield []');
+    // keyframe step selectors must never leak out as if they were components
+    assert.ok(!MINE.mineMotion(css).some(l => /^(from|to|\d+%)\s*\{/.test(l)), 'raw keyframe step leaked as a rule');
+});
+
+await t2('mineAssets BEHAVIOUR: real DOM yields real URLs, junk yields none', async () => {
+    const html = '<html><head><meta property="og:image" content="/og.png">' +
+        '<link rel="icon" href="data:image/x-icon;base64,AAAA"></head><body>' +
+        '<img src="/hero.avif" alt="Hero shot" width="1200" height="800">' +
+        '<img src="/hero.avif" alt="Hero shot">' +
+        '<svg><use href="/s.svg#star"></use></svg>' +
+        '<video poster="/teaser.jpg"></video></body></html>';
+    const $ = cheerio.load(html);
+    const a = EXTRACT.mineAssets($, 'https://acme.test/page');
+    assert.ok(a.length > 0, 'mineAssets returned nothing for a page with images');
+    assert.ok(a.some(l => l.includes('https://acme.test/og.png')), 'og:image missing or not absolutised');
+    assert.ok(a.some(l => l.includes('/hero.avif') && /1200x800/.test(l) && /Hero shot/.test(l)), 'img lost alt or dimensions');
+    assert.strictEqual(a.filter(l => l.includes('/hero.avif')).length, 1, 'duplicate img not collapsed');
+    assert.ok(a.some(l => l.includes('/s.svg#star')), 'icon sprite ref lost');
+    assert.ok(a.some(l => l.includes('/teaser.jpg')), 'video poster lost');
+    assert.ok(!a.some(l => /data:image/.test(l)), 'base64 asset leaked into the block (the example.com junk line)');
+    assert.deepStrictEqual(EXTRACT.mineAssets(cheerio.load('<html><body></body></html>'), 'https://e.test'), [],
+        'asset-free page must yield []');
+    // cap is honoured: 200 images must not produce an unbounded block
+    const many = cheerio.load('<body>' + Array.from({ length: 200 }, (_, i) => `<img src="/i${i}.png">`).join('') + '</body>');
+    const big = EXTRACT.mineAssets(many, 'https://acme.test');
+    assert.ok(big.length <= 40 && big.join('\n').length <= 1800, 'asset cap breached: ' + big.length + ' lines');
+});
+
+await t2('pipeline exposes motion + assets as populated arrays (no phantom promise)', async () => {
+    // Wires the contract end-to-end without network: a fake $ and css prove the
+    // fields are produced from real inputs, which the source grep cannot.
+    const { buildAnalysisPrompt } = require(path.join(ROOT, 'lib/pipeline.js'));
+    assert.ok(typeof MINE.mineMotion === 'function', 'mineMotion not exported from lib/mine.js');
+    assert.ok(typeof EXTRACT.mineAssets === 'function', 'mineAssets not exported from lib/extract.js');
+    assert.ok(typeof buildAnalysisPrompt === 'function', 'pipeline export drifted');
+    const pipe = require('fs').readFileSync(path.join(ROOT, 'lib/pipeline.js'), 'utf8');
+    assert.ok(/assets:\s*mineAssets\(/.test(pipe) && /motion:\s*mineMotion\(/.test(pipe), 'pipeline stopped wiring them');
+});
+
+await t2('empty data blocks never render as empty headings', async () => {
+    const spec = assembleSpec('BUILD PROMPT\nx\n', { domain: 'e.test', extracted: { designTokens: [], componentRules: '', pageOutline: '  ', assets: [], motion: '' } });
+    assert.strictEqual(spec.split('## ').length - 1, 0, 'an empty section was emitted: ' + spec);
+});
+
+await t2('a failed narrative still ships the data (assembly never throws)', async () => {
+    assert.strictEqual(assembleSpec('', ANALYSIS), '');
+    assert.ok(assembleSpec('BUILD PROMPT line', {}).includes('BUILD PROMPT line'), 'lost the narrative');
+});
+
+
+// --- content extraction: the "half the page's text is missing" report -------
+// These exist because the reviewer's complaint was measured, not guessed:
+// on a real marketing page the footer is ~43% of visible text and our flat
+// 16-item cap kept ~47% of everything. Each test below was mutation-checked
+// (neuter the fix in lib/extract.js, require the suite to go RED).
+
+await t2('footer list groups keep their heading (structure, not a blob)', async () => {
+    const cols = ['Products', 'Features', 'Company'].map((h, i) =>
+        '<div><h3>' + h + '</h3><ul>' +
+        ['One', 'Two', 'Three'].map(x => '<li><a href="#">' + x + i + '</a></li>').join('') +
+        '</ul></div>').join('');
+    const out = extractPageOutline(cheerio.load(
+        '<html><head><title>T</title></head><body><footer>' + cols + '</footer></body></html>'));
+    const line = (out.match(/Footer links: ([\s\S]*?)(?:\nElement counts|\nNOT CAPTURED|$)/) || [])[1] || '';
+    for (const h of ['Products:', 'Features:', 'Company:'])
+        assert.ok(line.includes(h), 'column heading lost, so a builder must invent it: ' + line.slice(0, 160));
+});
+
+await t2('group boundary and item separator are distinguishable', async () => {
+    // Same delimiter at both levels made 21 groups read as one undifferentiated
+    // list - the exact defect this change exists to remove.
+    const out = extractPageOutline(cheerio.load('<html><head><title>T</title></head><body><footer>' +
+        '<div><h3>Products</h3><ul><li><a>Claude</a></li><li><a>Code</a></li></ul></div>' +
+        '<div><h3>Company</h3><ul><li><a>About</a></li><li><a>Careers</a></li></ul></div>' +
+        '</footer></body></html>'));
+    const line = (out.match(/Footer links: ([^\n]*)/) || [])[1] || '';
+    assert.ok(/Products: Claude, Code \| Company: About, Careers/.test(line),
+        'levels not separable: ' + JSON.stringify(line));
+});
+
+await t2('list item text is captured, not merely counted', async () => {
+    // Pricing feature lists are <li>. We used to emit "64 lists" and nothing
+    // of what they said, which is how invented plan features got blamed on us.
+    const feats = ['Unlimited projects', 'Priority support', 'Team seats'].map(t => '<li>' + t + '</li>').join('');
+    const out = extractPageOutline(cheerio.load('<html><head><title>T</title></head><body>' +
+        '<section><ul>' + feats + '</ul></section></body></html>'));
+    assert.ok(/List items: .*Unlimited projects/.test(out), 'li text dropped: ' + out.slice(0, 200));
+    assert.ok(/lists/.test(out), 'element counts lost their list entry');
+});
+
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);
+})();
