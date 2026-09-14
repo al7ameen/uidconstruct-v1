@@ -15,3 +15,6 @@ _p0/extraction-blob-*.json
 _p0/*-blob-*.json
 _p0/raw-*.json
 extraction-blob-*.json
+
+# also ignore a node_modules SYMLINK (trailing-slash rule matches dirs only)
+node_modules
