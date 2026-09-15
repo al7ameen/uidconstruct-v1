@@ -123,3 +123,50 @@ Rule inherited: every guard must be shown to fail (mutation) before it is believ
   — same class as published spec pages; flagged consciously, removal is a product decision.
 - `lib/*_old.js` are imported artifacts from the pinned original at f3a543c; harmless,
   unreferenced; delete only with explicit instruction.
+
+---
+
+## P4 STATUS (2026-09-15) - IMPLEMENTED, LOCAL ONLY
+
+Stage: DNA -> ContentSpec (AI call #2). Committed locally, NOT pushed, NOT deployed.
+
+### What shipped
+- `lib/userbrand.js` - `userbrand/1`, the only identity permitted in a generated
+  site. Shape validation is kept separate from stage policy on purpose: the
+  `rejectForGeneration` gate answers "may this enter generation", not "is this
+  well-formed".
+- `lib/content-prompt.js` - AI #2 prompt. Emits interpretive DNA words only:
+  zero hex, zero px, zero ms by construction, enforced by dropping numerics in
+  `dnaToText` rather than by asking the model to behave.
+- `lib/content.js` - one raw call by default (`CONTENT_REPAIR_RETRIES` = 0),
+  `postValidate` = `validateContent` + exact brand-echo + filler + dead-anchor,
+  identity scan applied BEFORE and AFTER generation with zero exemptions, cache
+  keyed on the canonical prompt hash + model.
+- `tests/content.test.js` - 74 tests, all mocked via `opts.callAI`. Zero live
+  calls in the suite.
+- `lib/compiler/index.js` (P3) is byte-for-byte unchanged: `git status` lists no
+  modification under `lib/compiler/`. The zero-exemption firewall behaviour
+  restored at P3 is what P4 matches at both stages.
+
+### Decisions actually taken
+- The proposed user-brand *exemption* was retracted after measurement:
+  `makeScanner` fires on the full token, so near-collisions were never being
+  refused and the exemption bought nothing. Tier-1 stays zero-exemption.
+- Defense in depth kept, and measured: deleting the `validateContent` call from
+  `postValidate` still leaves external/`javascript:` hrefs rejected, because
+  `findDeadAnchors` independently refuses any href not naming a real section.
+  Mutation M1 therefore pins D1/D2/D5/D10 and deliberately NOT D3/D4. A future
+  "simplification" of the anchor layer must answer for that.
+
+### Repair-flag asymmetry (intentional, not a bug)
+- `lib/content.js` accepts `repair` as `false` OR as an explicit number.
+- `lib/dna.js` honours only `repair === false`; there is no numeric opt-in.
+- Documented so nobody "unifies" them and silently changes the call budget.
+
+### Not yet true, and not claimed
+- There is **no production orchestrator**. `buildDna`, `buildContent` and
+  `compileSite` have zero callers outside `tests/`; `api/` still serves only the
+  original P0 deconstruct endpoint. The <=2-raw-call generation budget is
+  enforced *per stage* and pinned by tests, but no wired path spends it yet.
+- No live AI call #2 has been made. Every budget figure in this section comes
+  from a mocked counting caller.

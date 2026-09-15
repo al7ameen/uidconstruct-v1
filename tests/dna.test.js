@@ -12,6 +12,8 @@
 
 const assert = require('assert');
 const path = require('path');
+const fs = require('fs');
+const { execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
 const { buildDesignFacts } = require(path.join(ROOT, 'lib/facts.js'));
@@ -732,6 +734,38 @@ test('E8 model cannot choose its own provenance', async function () {
     assert.strictEqual(res.dna.factsHash, res.factsHash, 'model forged the factsHash');
 });
 
+test('E9 repair:false spends exactly ONE raw call (generation budget)', async function () {
+    dna.clearDnaCache();
+    const facts = buildDesignFacts(clone(F.EXTRACTED), clone(F.META));
+    const c = countingCaller(function () { return canonicalJson({ schema: 'designdna/1', nope: true }); });
+    let err = null;
+    try {
+        await dna.buildDna(facts, { callAI: c.fn, model: 'qwen3.8-flash', repair: false });
+    } catch (e) { err = e; }
+    // ARCHITECTURE pins a full generation at <=2 RAW calls, ONE per stage. If the DNA
+    // stage silently retries, the real budget is 3 and the documented number is a lie.
+    assert.strictEqual(c.state.calls, 1,
+        'repair:false still spent ' + c.state.calls + ' calls - the generation budget is not 2 raw calls');
+    assert.ok(err, 'an invalid answer must still reject, retry or no retry');
+    assert.strictEqual(err.name, 'DnaValidationError');
+});
+
+test('E10 repair:true keeps the retry (flag honored in BOTH directions)', async function () {
+    dna.clearDnaCache();
+    const facts = buildDesignFacts(clone(F.EXTRACTED), clone(F.META));
+    const ctx = makeCtx();
+    const c = countingCaller(function (msgs, n) {
+        if (n === 1) return canonicalJson({ schema: 'designdna/1', nope: true });
+        return canonicalJson(F.validDnaFrom(ctxWith(ctx, facts)));
+    });
+    const res = await dna.buildDna(facts, { callAI: c.fn, model: 'qwen3.8-flash', repair: true });
+    // Without this, a mutant that forces the budget to 0 passes E9 and looks like a
+    // correct implementation. E9 alone pins only half the switch.
+    assert.strictEqual(c.state.calls, 2, 'repair:true did not retry - the option is being read as false');
+    assert.strictEqual(res.aiCalls, 2);
+    assert.strictEqual(res.dna.schema, 'designdna/1');
+});
+
 // ---------------------------------------------------------------------------
 // F. DETERMINISM
 // ---------------------------------------------------------------------------
@@ -834,6 +868,63 @@ test('F7 identical facts hash identically across independent builds (url exclude
 });
 
 // ---------------------------------------------------------------------------
+// M. MUTATION CHECKS
+// Every guard above is paired with a mutant that must go RED. This file had no
+// mutation harness at all before P4, which is how "repair:false" could sit
+// implemented in lib/dna.js with nothing pinning it.
+// ---------------------------------------------------------------------------
+const BUDGET_LINE = '            const budget = (o.repair === false) ? 0 : repairRetries();';
+
+const MUTATIONS = [
+    { name: 'M1 repair:false flag ignored', file: 'lib/dna.js',
+      find: BUDGET_LINE,
+      to: '            const budget = repairRetries(); // MUTANT',
+      // Ignores the option, so the generation path retries again. Only E9 notices:
+      // E1/E3/E10 all describe the DEFAULT path, which this mutant leaves untouched.
+      expect: ['E9'] },
+    { name: 'M2 repair budget forced to zero', file: 'lib/dna.js',
+      find: BUDGET_LINE,
+      to: '            const budget = 0; // MUTANT',
+      // The mirror image: the flag now always means "never repair". E9 stays green by
+      // accident, so the evidence has to come from the default path.
+      expect: ['E10', 'E1'] },
+];
+
+test('M0 mutation anchors exist exactly once in their files', () => {
+    for (const m of MUTATIONS) {
+        const src = fs.readFileSync(path.join(ROOT, m.file), 'utf8');
+        const count = src.split(m.find).length - 1;
+        assert.strictEqual(count, 1, m.name + ': anchor found ' + count + 'x in ' + m.file);
+    }
+});
+
+for (const m of MUTATIONS) {
+    test(m.name, () => {
+        const tmp = fs.mkdtempSync(path.join(require('os').tmpdir(), 'dmut-'));
+        for (const d of ['lib', 'tests']) fs.cpSync(path.join(ROOT, d), path.join(tmp, d), { recursive: true });
+        fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(tmp, 'node_modules'));
+        const target = path.join(tmp, m.file);
+        const src = fs.readFileSync(target, 'utf8');
+        assert.strictEqual(src.split(m.find).length - 1, 1);
+        fs.writeFileSync(target, src.replace(m.find, m.to));
+        let out = ''; let code = 0;
+        try {
+            out = execFileSync(process.execPath, [path.join(tmp, 'tests/dna.test.js'), '--no-mutate'],
+                { encoding: 'utf8', env: Object.assign({}, process.env, { ONLY: '' }), timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'] });
+        } catch (e) {
+            code = e.status === undefined ? -1 : e.status;
+            out = String(e.stdout || '') + String(e.stderr || '');
+        }
+        if (code === 0) assert.fail('MUTANT SURVIVED: with ' + m.file + ' mutated (' + m.name + '), expected red on [' + m.expect.join(', ') + ']');
+        const failedNames = out.split('\n').filter((l) => l.startsWith('  FAIL ')).map((l) => l.slice(7).trim());
+        for (const want of m.expect) {
+            assert.ok(failedNames.some((nm) => nm.startsWith(want.trim())),
+                'mutant ' + m.name + ': expected red on "' + want + '", but only [' + (failedNames.join(' | ') || 'nothing') + '] failed');
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 const started = Date.now();
@@ -844,7 +935,8 @@ const started = Date.now();
     // LOUDLY - an empty queue reports "0 passed / 0 failed" and looks green,
     // which is the test-that-cannot-fail trap wearing a runner's clothes.
     const only = (process.env.ONLY || '').trim();
-    let queue = tests;
+    const NO_MUTATE = process.argv.includes('--no-mutate');
+    let queue = NO_MUTATE ? tests.filter(function (t) { return !/^M\d/.test(t.name); }) : tests;
     if (only) {
         // An ID-shaped filter ("C1", "D9") must match that test ALONE. Plain substring
         // made ONLY="C1" silently run C10-C15 as well (measured: -> 7/61), so a pass
